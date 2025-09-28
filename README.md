@@ -2,8 +2,8 @@
 This is our final year project for BE-2026
 
 ### Camera / Video Feed
-        │
-        ▼
+###     │
+###     ▼
 ### [YOLOv8 Detection Model]  → detects license plate bounding box
         │
         ▼
