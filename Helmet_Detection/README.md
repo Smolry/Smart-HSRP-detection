@@ -14,7 +14,9 @@ It can detect:
 ### Google Colab Setup
 1. Open the [Colab Notebook](https://colab.research.google.com/drive/)
 
-2. Upload the dataset which is inside the zip file 
+2. Upload the dataset which is inside the zip file
+    (dataset link :- https://www.kaggle.com/datasets/aryanvaid13/indian-helmet-detection-dataset?select=data.yaml)
+
 
 3. Install YOLOv8:
 ```bash
