@@ -1,0 +1,42 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Node (if frontend inside repo)
+node_modules/
+
+# Build / dist
+dist/
+build/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Model weights (if large)
+*.pt
+*.pth
+
+# Output videos (VERY IMPORTANT)
+static/outputs/
+uploads/

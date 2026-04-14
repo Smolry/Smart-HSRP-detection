@@ -1,0 +1,50 @@
+# ============================================================
+# SMART HSRP MONITORING SYSTEM — requirements.txt
+# ============================================================
+
+# ── Web Framework ────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9        # file uploads
+
+# ── AI / ML ──────────────────────────────────────────────────
+torch>=2.3.0
+torchvision>=0.18.0
+ultralytics>=8.2.0             # YOLOv8/v11 (vehicle, helmet, plate detectors)
+easyocr>=1.7.1                 # Plate OCR
+deep-sort-realtime>=1.3.2      # Vehicle tracking (DeepSORT)
+numpy>=1.26.0
+opencv-python-headless>=4.9.0  # CV utilities (headless for servers)
+
+# ── Auth ─────────────────────────────────────────────────────
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+
+# ── Database ─────────────────────────────────────────────────
+psycopg2-binary>=2.9.9
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+pydantic[email]
+
+# ── AWS ─────────────────────────────────────────────────
+boto3
+
+# ── Async job state (replaces in-memory JOB_STORE) ───────────
+aioredis>=2.0.1
+redis>=5.0.0                   # sync redis client used by worker processes
+
+# ── gRPC ─────────────────────────────────────────────────────
+grpcio>=1.64.0
+grpcio-tools>=1.64.0           # protoc code generation
+grpcio-reflection>=1.64.0      # optional: gRPC server reflection for debugging
+
+# ── Utilities ────────────────────────────────────────────────
+python-dotenv>=1.0.1
+matplotlib>=3.9.0              # compare_performance plotting
+Pillow>=10.3.0
+
+# ── Optional / Dev ───────────────────────────────────────────
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0                  # async test client
