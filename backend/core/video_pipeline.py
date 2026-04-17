@@ -16,6 +16,7 @@ FIXES:
 - Enhanced exception reporting
 """
 
+import os
 import time
 import cv2
 import numpy as np
@@ -25,6 +26,7 @@ from collections import deque
 import traceback
 import logging
 
+from backend.utils.local_storage import get_video_url
 from backend.services.video_reader import read_video
 from backend.core.model_registry import (
     vehicle_detector, plate_detector,
@@ -68,6 +70,7 @@ def process_video(
     annotate_violations:    bool = True,
     annotate_no_violations: bool = False,
     ocr_mode:               str  = "always",   # "always"|"on_violation"|"on_clean"|"off"
+    job_id:                 Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Full processing pipeline for a video file.
@@ -113,6 +116,7 @@ def process_video(
 
     # ── Video properties for output writer ───────
     video_writer: Optional[AsyncVideoWriter] = None
+    local_url: Optional[str] = None
     source_fps = _get_video_fps(video_path)
 
     # Map for quick frame lookup when writing annotated video
@@ -385,7 +389,7 @@ def process_video(
         logger.error(traceback.format_exc())
         raise
     finally:
-        # CRITICAL: Properly release video writer
+        # ── Release video writer ─────────────────────────────
         if video_writer:
             try:
                 logger.info("Releasing video writer...")
@@ -393,18 +397,25 @@ def process_video(
                 logger.info("Video writer released successfully")
             except Exception as e:
                 logger.error(f"Error releasing video writer: {e}")
-
-        # ── Evaluate all tracks for storage ───────────────────────────
+                
+        
+        # ── Build local video URL (EC2 static serving) ──────
+        if output_video_path and os.path.exists(output_video_path):
+            local_url = get_video_url(job_id)
+            logger.info(f"Output video ready locally: {output_video_path} → {local_url}")
+        else:
+            local_url = None
+            
+        # ── Evaluate all tracks for storage ──────────────────
         violations      = []
         track_summaries = {}
-
+        
         if db_gate:
             for tid in list(db_gate._tracks.keys()):
                 decision = db_gate.evaluate_track(tid)
                 if decision["should_store"]:
                     violations.append(decision["record"])
-
-                # Overlay db_gate quality info onto live_track_data
+                
                 if tid in live_track_data:
                     live_track_data[tid].update({
                         "violation_type":       db_gate._tracks[tid].violation_type,
@@ -412,36 +423,39 @@ def process_video(
                         "quality_score":        decision.get("quality_score", 0.0),
                         "should_store":         decision["should_store"],
                         "needs_review":         decision.get("needs_manual_review", False),
-                        "plate_number":         (
+                        "plate_number": (
                             live_track_data[tid].get("plate_number")
                             or _best_plate(db_gate._tracks[tid])
                         ),
                     })
-
-        # ── Build final track_summaries from live_track_data ──────────
-        # This includes ALL detected vehicles — violating AND clean.
+        
+        # ── Build track summaries ────────────────────────────
         for tid, td in live_track_data.items():
             track_summaries[tid] = td
-
+            
         output["violations"]      = violations
         output["track_summaries"] = track_summaries
-        output["all_tracks"]      = track_summaries   # alias for routes.py merge
-
-        # ── Final metadata ────────────────────────
+        output["all_tracks"]      = track_summaries
+        
+        # ── ✅ ADD THIS (CRITICAL FOR FRONTEND) ──────────────
+        output["video_url"] = local_url
+        
+        # ── Metadata ─────────────────────────────────────────
         output["metadata"]["total_frames_read"]      = frame_count
         output["metadata"]["total_frames_processed"] = processed_count
         output["metadata"]["processing_end"]         = time.time()
         output["metadata"]["total_time_seconds"]     = round(
             output["metadata"]["processing_end"] - output["metadata"]["processing_start"], 2
         )
+        
         if processing_times:
             avg = sum(processing_times) / len(processing_times)
             output["metadata"]["avg_frame_time_ms"] = round(avg * 1000, 2)
             output["metadata"]["avg_fps"]           = round(1.0 / avg if avg > 0 else 0, 2)
-
+            
         if pipeline:
             output["temporal_stats"] = pipeline.get_statistics()
-
+            
         if learner:
             output["adaptive_thresholds"] = learner.get_all_thresholds()
             learner.save_progress()

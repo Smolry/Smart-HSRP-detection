@@ -33,10 +33,16 @@ class Settings(BaseSettings):
     HELMET_YES_THRESHOLD: float
     FRAME_SKIP: int
 
-
-    # --- Database & Storage ---
+    # --- Database ---
     DATABASE_URL: str
-    STORAGE_DIR: str
+
+    # --- Local Storage (EC2 disk) ---
+    # Root folder for input/output videos, served as /static/**
+    STORAGE_DIR: str = "static"
+
+    # --- Redis ---
+    REDIS_HOST: str
+    REDIS_PORT: int
 
     # --- API ---
     HOST: str = "127.0.0.1"
@@ -45,12 +51,12 @@ class Settings(BaseSettings):
 
     # --- Non-settings (computed / helpers) ---
     BASE_DIR: ClassVar[Path] = BASE_DIR
-
     DB_CONFIG: ClassVar[dict] = {}
 
     model_config = {
         "env_file": ".env",
         "case_sensitive": False,
+        "extra": "allow",
     }
 
 

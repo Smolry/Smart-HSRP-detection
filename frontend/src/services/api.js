@@ -2,7 +2,10 @@
  * api.js — unified API service
  *
  * REST:       auth, violations, thresholds, job result/tracks  → FastAPI :8000
- * WebSocket:  job progress stream                              → FastAPI :8000/api/ws/job/:id
+ * WebSocket:  job progress stream                              → FastAPI :8000/api/ws/:id
+ *
+ * Fix: WebSocket URL was /api/ws/job/{id} — corrected to /api/ws/{id}
+ *      to match the backend route @router.websocket("/ws/{job_id}")
  */
 
 const REST_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
@@ -49,20 +52,19 @@ export async function uploadVideo(token, file, options = {}) {
 // ── WebSocket job stream ──────────────────────────────────────────────────────
 
 /**
- * connectJobStream — replaces pollJobProgress entirely.
+ * connectJobStream — opens a WebSocket to /api/ws/{jobId}.
  *
- * Opens a WebSocket to /api/ws/job/:jobId.
- * The server sends a message on every progress update — no polling.
+ * The server sends a message on every progress update and on completion.
  *
- * onUpdate(data)  — called on every message while status === 'running'
+ * onUpdate(data)  — called while status === 'running'
  * onDone(data)    — called once when status === 'completed'
  * onError(err)    — called on WS error or status === 'failed'
  *
  * Returns a cancel() function that closes the socket.
  */
 export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
-  // Pass token as a query param — WebSocket API has no custom headers
-  const url = `${WS_BASE}/api/ws/job/${jobId}?token=${encodeURIComponent(token)}`;
+  // FIX: path was /api/ws/job/${jobId} — backend route is /ws/{job_id} (no "job" segment)
+  const url = `${WS_BASE}/api/ws/${jobId}?token=${encodeURIComponent(token)}`;
   const ws = new WebSocket(url);
 
   ws.onmessage = (event) => {
@@ -96,9 +98,8 @@ export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
     // status === 'running'
     onUpdate({
       progress:     data.progress     ?? 0,
-      total_frames: data.total_frames ?? 0,
+      total_frames: data.total        ?? 0,
       status:       data.status,
-      mode:         data.mode         ?? 'batch',
       fps:          data.fps          ?? 0,
     });
   };
@@ -108,7 +109,7 @@ export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
   };
 
   ws.onclose = (event) => {
-    // Abnormal close that wasn't already handled above
+    // Abnormal close not already handled above
     if (event.code !== 1000 && event.code !== 1005) {
       onError(new Error(`WebSocket closed unexpectedly (code ${event.code})`));
     }
@@ -140,11 +141,11 @@ export function getVideoUrl(jobId) {
 
 export async function getViolations(token, params = {}) {
   const qs = new URLSearchParams();
-  if (params.limit)              qs.set('limit',          params.limit);
-  if (params.offset)             qs.set('offset',         params.offset);
-  if (params.violationType)      qs.set('violation_type', params.violationType);
-  if (params.needsReview != null) qs.set('needs_review',  params.needsReview);
-  if (params.minQuality)         qs.set('min_quality',    params.minQuality);
+  if (params.limit)               qs.set('limit',          params.limit);
+  if (params.offset)              qs.set('offset',         params.offset);
+  if (params.violationType)       qs.set('violation_type', params.violationType);
+  if (params.needsReview != null) qs.set('needs_review',   params.needsReview);
+  if (params.minQuality)          qs.set('min_quality',    params.minQuality);
   return apiFetch(`/api/violations?${qs}`, {}, token);
 }
 

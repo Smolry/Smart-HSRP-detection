@@ -1,10 +1,14 @@
 """
 API ROUTES
 ===========
-Production-ready version for AWS deployment
+EC2 local storage version — S3 completely removed.
+
+Videos are saved to and served from the EC2 filesystem via FastAPI StaticFiles.
+- Input  → static/inputs/<job_id>.mp4  (cleaned up after processing)
+- Output → static/outputs/<job_id>.mp4 (served via /static/outputs/<job_id>.mp4)
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import FileResponse
 import tempfile
 import os
@@ -15,9 +19,7 @@ from uuid import uuid4
 from typing import Optional
 from pathlib import Path
 import logging
-import sys
 import time
-import boto3
 
 import redis.asyncio as redis
 
@@ -28,13 +30,18 @@ from backend.services.storage import (
     save_threshold_state,
     load_threshold_state,
 )
+from backend.db.database import get_db
+from backend.utils.local_storage import (
+    save_input_video,
+    get_output_video_path,
+    get_video_url,
+    output_video_exists,
+    cleanup_input,
+)
 
 # ── Logging ─────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Globals ─────────────────────────────────────
@@ -52,21 +59,11 @@ async def init_redis():
         port=int(os.getenv("REDIS_PORT", 6379)),
         decode_responses=True,
     )
-    logger.info("✅ Redis connected")
+    logger.info("Redis connected")
 
 async def close_redis():
     if redis_client:
         await redis_client.close()
-
-# ── Redis Health ────────────────────────────────
-
-@router.get("/redis-health")
-async def redis_health():
-    try:
-        pong = await redis_client.ping()
-        return {"status": "ok", "redis": pong}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
 
 # ── Redis Helpers ───────────────────────────────
 
@@ -85,27 +82,14 @@ async def job_get(job_id: str):
         for k, v in data.items()
     }
 
-# ── S3 upload ───────────────────────────────
-
-s3 = boto3.client("s3")
-
-def upload_to_s3(file_path: str, job_id: str) -> str:
-    bucket = os.getenv("S3_BUCKET")
-
-    key = f"outputs/{job_id}.mp4"
-
-    s3.upload_file(file_path, bucket, key)
-
-    return f"https://{bucket}.s3.amazonaws.com/{key}"
-
-# ── Worker (FIXED) ──────────────────────────────
+# ── Worker ─────────────────────────────────────
 
 def run_pipeline_sync(job_id, video_path, output_video_path,
                       frame_skip, annotate_violations,
                       annotate_no_violations, ocr_mode):
 
     import redis as sync_redis
-    import json, traceback, os, time
+    import traceback
 
     r = sync_redis.Redis(
         host=os.getenv("REDIS_HOST", "localhost"),
@@ -124,17 +108,20 @@ def run_pipeline_sync(job_id, video_path, output_video_path,
         r.publish(channel, json.dumps(data))
 
     try:
+        # ── Progress callback ───────────────
         def progress_cb(frames, total):
             elapsed = time.time() - start_time
             fps = frames / elapsed if elapsed > 0 else 0
-
             publish({
                 "status": "running",
                 "progress": frames,
                 "total": total,
-                "fps": round(fps, 2)
+                "fps": round(fps, 2),
             })
 
+        # ── Run pipeline ────────────────────────────────────────────────
+        # process_video writes output to output_video_path on local disk.
+        # It returns output["video_url"] as the /static/outputs/<job_id>.mp4 URL.
         output = process_video(
             video_path=video_path,
             output_video_path=output_video_path,
@@ -143,34 +130,42 @@ def run_pipeline_sync(job_id, video_path, output_video_path,
             annotate_no_violations=annotate_no_violations,
             ocr_mode=ocr_mode,
             progress_callback=progress_cb,
+            job_id=job_id,
         )
 
+        # ── Store violations in DB ──────────────────────────────────────
         if output.get("violations"):
             store_violations_batch(output["violations"])
 
         summary = generate_violation_summary(output)
 
-        s3_url = None
-        
-        if output_video_path and os.path.exists(output_video_path):
-            s3_url = upload_to_s3(output_video_path, job_id)
-            
+        # ── Local video URL (set by pipeline via get_video_url) ─────────
+        local_video_url = output.get("video_url") or get_video_url(job_id)
+
+        logger.info(f"[{job_id}] Output video available at: {local_video_url}")
+
         publish({
             "status": "completed",
             "summary": summary,
-            "video_url": s3_url
-            })
+            "video_url": local_video_url,
+        })
 
     except Exception as e:
         publish({
             "status": "failed",
             "error": str(e),
-            "trace": traceback.format_exc()
+            "trace": traceback.format_exc(),
         })
 
     finally:
-        if os.path.exists(video_path):
-            os.remove(video_path)
+        # Clean up the raw input video to free space; output stays for serving
+        cleanup_input(job_id)
+        # Also clean up any leftover temp file
+        if video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+            except Exception:
+                pass
 
 # ── Upload Endpoint ─────────────────────────────
 
@@ -185,18 +180,26 @@ async def process_video_endpoint(
 ):
     suffix = os.path.splitext(file.filename)[1] or ".mp4"
 
+    # ── Save uploaded file to a temp location ────────────────
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
-        video_path = tmp.name
+        tmp_path = tmp.name
 
     job_id = str(uuid4())
 
-    output_video_path = None
-    if save_output_video:
-        Path("static/outputs").mkdir(parents=True, exist_ok=True)
-        output_video_path = f"static/outputs/{job_id}.mp4"
+    # ── Copy to static/inputs/<job_id>.mp4 for traceability ──
+    video_path = save_input_video(tmp_path, job_id)
+    os.remove(tmp_path)   # remove the original temp file
 
-    await job_set(job_id, {"status": "queued"})
+    logger.info(f"[{job_id}] Input saved locally: {video_path}")
+
+    # ── Output path on EC2 disk ───────────────────────────────
+    output_video_path = get_output_video_path(job_id) if save_output_video else None
+
+    await job_set(job_id, {
+        "status": "queued",
+        "input_video_path": video_path,
+    })
 
     loop = asyncio.get_event_loop()
     loop.run_in_executor(
@@ -208,12 +211,12 @@ async def process_video_endpoint(
         frame_skip,
         annotate_violations,
         annotate_no_violations,
-        ocr_mode
+        ocr_mode,
     )
 
     return {"job_id": job_id}
 
-# ── WebSocket (FIXED) ───────────────────────────
+# ── WebSocket ─────────────────────────────────────────────────────────────────
 
 @router.websocket("/ws/{job_id}")
 async def websocket_progress(websocket: WebSocket, job_id: str):
@@ -224,14 +227,9 @@ async def websocket_progress(websocket: WebSocket, job_id: str):
 
     try:
         while True:
-            message = await pubsub.get_message(
-                ignore_subscribe_messages=True,
-                timeout=1.0
-            )
-
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             if message:
                 await websocket.send_text(message["data"])
-
             await asyncio.sleep(0.01)
 
     except WebSocketDisconnect:
@@ -241,50 +239,36 @@ async def websocket_progress(websocket: WebSocket, job_id: str):
         await pubsub.unsubscribe(f"job_progress:{job_id}")
         await pubsub.close()
 
-# ── Job status / result (kept — used after WS closes to fetch full result) ───
-
-@router.get("/job-status/{job_id}")
-async def job_status(job_id: str):
-    job = await job_get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return {
-        "job_id":       job_id,
-        "status":       job.get("status"),
-        "filename":     job.get("filename"),
-        "progress":     int(job.get("progress", 0)),
-        "total_frames": int(job.get("total_frames", 0)),
-        "mode":         job.get("mode", "batch"),
-        "fps":          float(job.get("fps", 0)),
-    }
-
+# ── Job Result ────────────────────────────────────────────────────────────────
 
 @router.get("/job-result/{job_id}")
 async def job_result(job_id: str):
     job = await job_get(job_id)
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
     if job.get("status") == "failed":
-        raise HTTPException(status_code=500, detail={
-            "error":    job.get("error", "Unknown error"),
-            "trace":    job.get("trace", ""),
-            "filename": job.get("filename", ""),
-        })
+        raise HTTPException(status_code=500, detail=job)
+
     if job.get("status") != "completed":
         raise HTTPException(status_code=400, detail="Job not completed yet")
+
     return job
 
+# ── Job Video — served directly from EC2 disk ─────────────────────────────────
 
 @router.get("/job-video/{job_id}")
 async def job_video(job_id: str):
     job = await job_get(job_id)
     if not job or job.get("status") != "completed":
         raise HTTPException(status_code=404, detail="Video not available")
-    path = job.get("output_video_path", "")
-    if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Video file not found")
-    return FileResponse(path, media_type="video/mp4", filename=f"output_{job_id}.mp4")
 
+    if not output_video_exists(job_id):
+        raise HTTPException(status_code=404, detail="Video file not found on disk")
+
+    path = get_output_video_path(job_id)
+    return FileResponse(path, media_type="video/mp4", filename=f"output_{job_id}.mp4")
 
 # ── Violations ────────────────────────────────────────────────────────────────
 
@@ -319,7 +303,6 @@ async def get_violation(violation_id: int):
     finally:
         db_gen.close()
 
-
 # ── Track summaries ───────────────────────────────────────────────────────────
 
 @router.get("/job-tracks/{job_id}")
@@ -330,7 +313,6 @@ async def job_tracks(job_id: str):
     track_summaries = job.get("track_summaries", {})
     tracks = sorted(track_summaries.values(), key=lambda t: t.get("first_frame", 0))
     return {"job_id": job_id, "tracks": tracks, "count": len(tracks)}
-
 
 # ── Adaptive thresholds ───────────────────────────────────────────────────────
 
@@ -344,7 +326,6 @@ async def reset_thresholds():
     defaults = {"hsrp": 0.50, "helmet": 0.40, "ocr_confidence": 0.60}
     save_threshold_state(defaults)
     return {"status": "reset", "thresholds": defaults}
-
 
 # ── Legacy ────────────────────────────────────────────────────────────────────
 

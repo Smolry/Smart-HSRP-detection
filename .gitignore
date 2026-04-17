@@ -40,3 +40,5 @@ build/
 # Output videos (VERY IMPORTANT)
 static/outputs/
 uploads/
+
+*.pem

@@ -38,6 +38,7 @@ app = FastAPI(
 static_dir = Path("static")
 static_dir.mkdir(exist_ok=True)
 (static_dir / "outputs").mkdir(exist_ok=True)
+(static_dir / "inputs").mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(

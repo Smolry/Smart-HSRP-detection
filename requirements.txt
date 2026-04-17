@@ -27,17 +27,10 @@ pydantic>=2.7.0
 pydantic-settings>=2.3.0
 pydantic[email]
 
-# ── AWS ─────────────────────────────────────────────────
-boto3
 
 # ── Async job state (replaces in-memory JOB_STORE) ───────────
 aioredis>=2.0.1
 redis>=5.0.0                   # sync redis client used by worker processes
-
-# ── gRPC ─────────────────────────────────────────────────────
-grpcio>=1.64.0
-grpcio-tools>=1.64.0           # protoc code generation
-grpcio-reflection>=1.64.0      # optional: gRPC server reflection for debugging
 
 # ── Utilities ────────────────────────────────────────────────
 python-dotenv>=1.0.1
