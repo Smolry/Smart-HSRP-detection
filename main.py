@@ -41,9 +41,20 @@ static_dir.mkdir(exist_ok=True)
 (static_dir / "inputs").mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# Read allowed origins from env so EC2 can add its public IP/domain
+# without changing code. On local, localhost:3000 is always included.
+import os as _os
+_extra_origins = [o.strip() for o in _os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+_allowed_origins = [
+    "http://localhost:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8000",
+] + _extra_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8000"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

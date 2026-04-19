@@ -1,17 +1,9 @@
 /**
  * api.js — unified API service
- *
- * REST:       auth, violations, thresholds, job result/tracks  → FastAPI :8000
- * WebSocket:  job progress stream                              → FastAPI :8000/api/ws/:id
- *
- * Fix: WebSocket URL was /api/ws/job/{id} — corrected to /api/ws/{id}
- *      to match the backend route @router.websocket("/ws/{job_id}")
  */
 
 const REST_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
-
-// WebSocket base — same host, swap http(s) → ws(s)
-const WS_BASE = REST_BASE.replace(/^http/, 'ws');
+const WS_BASE   = REST_BASE.replace(/^http/, 'ws');
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -32,18 +24,17 @@ async function apiFetch(path, opts = {}, token = null) {
 
 export async function uploadVideo(token, file, options = {}) {
   const form = new FormData();
-  form.append('file', file);
-  form.append('frame_skip',             String(options.frameSkip          ?? 1));
-  form.append('save_output_video',      String(options.saveVideo          ?? true));
-  form.append('annotate_violations',    String(options.annotateViolations ?? true));
+  form.append('file',                   file);
+  form.append('frame_skip',             String(options.frameSkip            ?? 1));
+  form.append('save_output_video',      String(options.saveVideo            ?? true));
+  form.append('annotate_violations',    String(options.annotateViolations   ?? true));
   form.append('annotate_no_violations', String(options.annotateNoViolations ?? false));
   form.append('ocr_mode',               options.ocrMode ?? 'on_violation');
-  form.append('mode',                   options.mode    ?? 'batch');
 
   const resp = await fetch(`${REST_BASE}/api/process-video`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
+    method:  'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body:    form,
   });
   if (!resp.ok) throw new Error(`Upload failed: ${resp.status}`);
   return resp.json();
@@ -54,68 +45,66 @@ export async function uploadVideo(token, file, options = {}) {
 /**
  * connectJobStream — opens a WebSocket to /api/ws/{jobId}.
  *
- * The server sends a message on every progress update and on completion.
+ * onUpdate(data)  — called on each 'running' progress message
+ * onDone()        — called once when status === 'completed'; REST fetch happens in caller
+ * onError(err)    — called on failure
  *
- * onUpdate(data)  — called while status === 'running'
- * onDone(data)    — called once when status === 'completed'
- * onError(err)    — called on WS error or status === 'failed'
- *
- * Returns a cancel() function that closes the socket.
+ * Returns a cancel() function.
  */
 export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
-  // FIX: path was /api/ws/job/${jobId} — backend route is /ws/{job_id} (no "job" segment)
-  const url = `${WS_BASE}/api/ws/${jobId}?token=${encodeURIComponent(token)}`;
-  const ws = new WebSocket(url);
+  const url = `${WS_BASE}/api/ws/${jobId}`;
+  const ws  = new WebSocket(url);
+
+  let done = false;
+
+  ws.onopen = () => console.log('[WS] connected:', url);
 
   ws.onmessage = (event) => {
+    if (done) return;
     let data;
-    try {
-      data = JSON.parse(event.data);
-    } catch {
-      return;
-    }
-
-    if (data.error && !data.status) {
-      onError(new Error(data.error));
-      ws.close();
-      return;
-    }
+    try { data = JSON.parse(event.data); } catch { return; }
 
     const status = data.status;
 
     if (status === 'failed') {
+      done = true;
       onError(new Error(data.error || 'Job failed'));
-      ws.close();
+      ws.close(1000);
       return;
     }
 
     if (status === 'completed') {
-      onDone(data);
-      ws.close();
+      done = true;
+      ws.close(1000);
+      onDone();   // caller does REST fetches
       return;
     }
 
-    // status === 'running'
-    onUpdate({
-      progress:     data.progress     ?? 0,
-      total_frames: data.total        ?? 0,
-      status:       data.status,
-      fps:          data.fps          ?? 0,
-    });
+    if (status === 'running') {
+      onUpdate({
+        progress:     data.progress     ?? 0,
+        total_frames: data.total        ?? 0,
+        fps:          data.fps          ?? 0,
+      });
+    }
   };
 
-  ws.onerror = () => {
+  ws.onerror = (e) => {
+    if (done) return;
+    console.error('[WS] error', e);
     onError(new Error('WebSocket connection error'));
   };
 
   ws.onclose = (event) => {
-    // Abnormal close not already handled above
+    if (done) return;
+    // 1000 = normal close, 1005 = no status (also normal)
     if (event.code !== 1000 && event.code !== 1005) {
       onError(new Error(`WebSocket closed unexpectedly (code ${event.code})`));
     }
   };
 
   return () => {
+    done = true;
     ws.onmessage = null;
     ws.onerror   = null;
     ws.onclose   = null;
@@ -123,16 +112,32 @@ export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
   };
 }
 
-// ── Job result / tracks (fetched via REST after WS signals completion) ────────
+// ── Job result / tracks ───────────────────────────────────────────────────────
+
+/**
+ * Retry up to `retries` times with `delay` ms between attempts.
+ * Needed because Redis write and REST read can race right after WS completion.
+ */
+async function fetchWithRetry(fn, retries = 5, delay = 800) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
 
 export async function getJobResult(token, jobId) {
-  return apiFetch(`/api/job-result/${jobId}`, {}, token);
+  return fetchWithRetry(() => apiFetch(`/api/job-result/${jobId}`, {}, token));
 }
 
 export async function getJobTracks(token, jobId) {
-  return apiFetch(`/api/job-tracks/${jobId}`, {}, token);
+  return fetchWithRetry(() => apiFetch(`/api/job-tracks/${jobId}`, {}, token));
 }
 
+// Returns the URL to stream/download the annotated video directly
 export function getVideoUrl(jobId) {
   return `${REST_BASE}/api/job-video/${jobId}`;
 }

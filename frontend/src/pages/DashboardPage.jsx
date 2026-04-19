@@ -3,11 +3,10 @@ import { useAuth } from '../hooks/useAuth';
 import { uploadVideo, connectJobStream, getJobResult, getJobTracks, getVideoUrl } from '../services/api';
 import {
   Upload, Play, CheckCircle, AlertCircle, ChevronDown, ChevronUp,
-  Film, Download, RefreshCw, Eye, Shield, ShieldOff, HardHat,
-  HardHatIcon, Zap, BarChart2, Layers
+  Film, Download, RefreshCw, BarChart2, Layers,
 } from 'lucide-react';
 
-// ── Design tokens (extend existing CSS vars) ──────────────────────────────────
+// ── Design tokens ─────────────────────────────────────────────────────────────
 const T = {
   green:     'var(--green,    #22c55e)',
   greenDim:  'var(--green-dim, rgba(34,197,94,0.08))',
@@ -32,23 +31,8 @@ const T = {
 function Card({ children, style = {}, noPad = false }) {
   return (
     <div style={{
-      background: T.card,
-      border: `1px solid ${T.border}`,
-      borderRadius: 14,
-      padding: noPad ? 0 : 24,
-      marginBottom: 20,
-      ...style,
-    }}>
-      {children}
-    </div>
-  );
-}
-
-function SectionLabel({ children }) {
-  return (
-    <div style={{
-      fontSize: 10, fontFamily: T.mono, letterSpacing: '0.12em',
-      color: T.textDim, textTransform: 'uppercase', marginBottom: 14,
+      background: T.card, border: `1px solid ${T.border}`,
+      borderRadius: 14, padding: noPad ? 0 : 24, marginBottom: 20, ...style,
     }}>
       {children}
     </div>
@@ -60,15 +44,14 @@ function Pill({ color, bg, children }) {
     <span style={{
       display: 'inline-flex', alignItems: 'center', gap: 4,
       padding: '2px 8px', borderRadius: 20,
-      fontSize: 11, fontFamily: T.mono,
-      color: color, background: bg,
+      fontSize: 11, fontFamily: T.mono, color, background: bg,
     }}>
       {children}
     </span>
   );
 }
 
-function StatCard({ label, value, sub, accent }) {
+function StatCard({ label, value, accent }) {
   return (
     <div style={{
       background: T.card, border: `1px solid ${T.border}`,
@@ -77,7 +60,6 @@ function StatCard({ label, value, sub, accent }) {
     }}>
       <div style={{ fontSize: 11, color: T.textDim, fontFamily: T.mono, marginBottom: 6 }}>{label}</div>
       <div style={{ fontSize: 28, fontWeight: 800, fontFamily: T.display, lineHeight: 1 }}>{value ?? '—'}</div>
-      {sub && <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}>{sub}</div>}
     </div>
   );
 }
@@ -152,9 +134,9 @@ function OptionsPanel({ opts, onChange }) {
               style={{ width: '100%' }} />
           </div>
           {[
-            ['saveVideo',           'Save annotated output video'],
-            ['annotateViolations',  'Annotate violation frames'],
-            ['annotateNoViolations','Annotate clean frames'],
+            ['saveVideo',            'Save annotated output video'],
+            ['annotateViolations',   'Annotate violation frames'],
+            ['annotateNoViolations', 'Annotate clean frames'],
           ].map(([key, label]) => (
             <label key={key} style={{ display: 'flex', gap: 8, cursor: 'pointer', fontSize: 12, color: T.textMuted, alignItems: 'center' }}>
               <input type="checkbox" checked={opts[key]}
@@ -168,17 +150,16 @@ function OptionsPanel({ opts, onChange }) {
   );
 }
 
-// ── Progress bar ──────────────────────────────────────────────────────────────
+// ── Progress card ─────────────────────────────────────────────────────────────
 
 function ProgressCard({ phase, progress }) {
   const isUploading = phase === 'uploading';
   const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
-
   return (
     <Card>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
         <span style={{ fontSize: 13, color: T.textMuted }}>
-          {isUploading ? 'Uploading video…' : `Processing frames…`}
+          {isUploading ? 'Uploading video…' : 'Processing frames…'}
         </span>
         {!isUploading && (
           <span style={{ fontSize: 11, fontFamily: T.mono, color: T.textDim }}>
@@ -191,8 +172,7 @@ function ProgressCard({ phase, progress }) {
           height: '100%',
           width: isUploading ? '100%' : `${pct || 4}%`,
           background: `linear-gradient(90deg, ${T.accent}, #a855f7)`,
-          borderRadius: 4,
-          transition: 'width 0.4s ease',
+          borderRadius: 4, transition: 'width 0.4s ease',
           animation: isUploading ? 'pulse 1.5s ease infinite' : 'none',
         }} />
       </div>
@@ -209,8 +189,10 @@ function ProgressCard({ phase, progress }) {
 // ── Annotated video player ────────────────────────────────────────────────────
 
 function VideoPlayer({ jobId }) {
-  const url = getVideoUrl(jobId);
-  const [err, setErr] = useState(false);
+  // Serve via /static/outputs directly — same server, no CORS issue,
+  // no crossOrigin attribute needed, no onError false-positives.
+  const REST_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+  const url = `${REST_BASE}/static/outputs/${jobId}.mp4`;
 
   return (
     <Card noPad style={{ overflow: 'hidden' }}>
@@ -225,46 +207,54 @@ function VideoPlayer({ jobId }) {
           </span>
         </div>
         <div style={{ display: 'flex', gap: 14, fontSize: 10, fontFamily: T.mono, color: T.textDim }}>
-          <span><span style={{ color: '#6b7280' }}>⬜</span> tracking</span>
-          <span><span style={{ color: T.amber }}>🟡</span> predicted</span>
-          <span><span style={{ color: T.red }}>🔴</span> confirmed</span>
+          <span style={{ color: '#6b7280' }}>⬜ tracking</span>
+          <span style={{ color: T.amber }}>🟡 predicted</span>
+          <span style={{ color: T.red }}>🔴 confirmed</span>
         </div>
       </div>
 
-      {err ? (
-        <div style={{ padding: 32, textAlign: 'center', color: T.textDim, fontSize: 13 }}>
-          Video not available yet. Try refreshing.
-        </div>
-      ) : (
-        <video
-          controls
-          style={{ width: '100%', display: 'block', maxHeight: 420, background: '#000' }}
-          onError={() => setErr(true)}
+      <video
+        key={jobId}
+        controls
+        style={{ width: '100%', display: 'block', maxHeight: 420, background: '#000' }}
+      >
+        <source src={url} type="video/mp4" />
+      </video>
+
+      <div style={{ padding: '8px 16px', borderTop: `1px solid ${T.border}`, textAlign: 'right' }}>
+        <a
+          href={url}
+          download
+          style={{ fontSize: 11, fontFamily: T.mono, color: T.textMuted, textDecoration: 'none' }}
         >
-          <source src={url} type="video/mp4" />
-        </video>
-      )}
+          ⬇ download video
+        </a>
+      </div>
     </Card>
   );
 }
 
-// ── Summary stat strip ────────────────────────────────────────────────────────
+// ── Summary stats ─────────────────────────────────────────────────────────────
 
 function SummaryStrip({ summary, meta }) {
-  const cards = [
-    { label: 'FRAMES PROCESSED', value: meta?.total_frames_processed ?? '—', accent: T.accent },
-    { label: 'AVG FPS',          value: meta?.avg_fps              ?? '—', accent: '#6366f1' },
-    { label: 'VIOLATIONS FOUND', value: summary?.total             ?? 0,   accent: T.red    },
-    { label: 'NEEDS REVIEW',     value: summary?.needs_review      ?? 0,   accent: T.amber  },
-  ];
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
-      {cards.map(c => <StatCard key={c.label} {...c} />)}
+      <StatCard label="FRAMES PROCESSED" value={meta?.total_frames_processed ?? '—'} accent={T.accent} />
+      <StatCard label="AVG FPS"           value={meta?.avg_fps              ?? '—'} accent="#6366f1" />
+      <StatCard label="VIOLATIONS FOUND"  value={summary?.total             ?? 0}   accent={T.red}   />
+      <StatCard label="NEEDS REVIEW"      value={summary?.needs_review      ?? 0}   accent={T.amber} />
     </div>
   );
 }
 
 // ── Track table ───────────────────────────────────────────────────────────────
+
+const tdStyle = { padding: '10px 14px', fontSize: 12, verticalAlign: 'middle', color: 'var(--text, #e5e5e5)' };
+const thStyle = {
+  ...tdStyle, fontSize: 10, fontFamily: T.mono, color: T.textDim,
+  letterSpacing: '0.1em', textTransform: 'uppercase', textAlign: 'left',
+  borderBottom: `1px solid ${T.border}`, background: 'rgba(255,255,255,0.02)', fontWeight: 500,
+};
 
 function fmtViolation(v) {
   if (!v) return null;
@@ -277,86 +267,64 @@ function TrackRow({ t, idx }) {
 
   const hsrp = (() => {
     const raw = t.hsrp_label || t.hsrp;
-    if (raw === 'hsrp') return { label: 'HSRP', color: T.green, bg: T.greenDim };
-    if (raw === 'non_hsrp' || raw === 'non hsrp' || t.violation_type === 'non_hsrp_plate')
-      return { label: 'Non-HSRP', color: T.red, bg: T.redDim };
+    if (raw === 'hsrp')                                           return { label: 'HSRP',     color: T.green, bg: T.greenDim };
+    if (raw === 'non_hsrp' || raw === 'non hsrp'
+        || t.violation_type === 'non_hsrp_plate')                 return { label: 'Non-HSRP', color: T.red,   bg: T.redDim   };
     return null;
   })();
 
   const helmet = (() => {
     if (!isTwoWheeler) return null;
     const raw = t.helmet_status || t.helmet;
-    if (raw === 'HELMET') return { label: 'Helmet', color: T.green, bg: T.greenDim };
-    if (raw === 'NO_HELMET' || t.violation_type === 'no_helmet')
-      return { label: 'No Helmet', color: T.red, bg: T.redDim };
-    if (raw === 'UNCERTAIN') return { label: 'Uncertain', color: T.amber, bg: T.amberDim };
+    if (raw === 'HELMET')                                         return { label: 'Helmet',    color: T.green, bg: T.greenDim };
+    if (raw === 'NO_HELMET' || t.violation_type === 'no_helmet')  return { label: 'No Helmet', color: T.red,   bg: T.redDim   };
+    if (raw === 'UNCERTAIN')                                       return { label: 'Uncertain', color: T.amber, bg: T.amberDim };
     return null;
   })();
 
   const violation = fmtViolation(t.violation_type);
   const stored    = t.should_store;
   const review    = t.needs_review;
-
-  const rowBg = stored && review ? T.amberDim
-              : stored           ? T.redDim
-              : 'transparent';
+  const rowBg     = stored && review ? T.amberDim : stored ? T.redDim : 'transparent';
 
   return (
     <tr style={{ background: rowBg, borderBottom: `1px solid ${T.border}` }}>
-      <td style={td}><span style={{ fontFamily: T.mono, fontSize: 11 }}>#{t.track_id ?? idx}</span></td>
-      <td style={td}>{vclass.charAt(0).toUpperCase() + vclass.slice(1)}</td>
-      <td style={td}><span style={{ fontFamily: T.mono, fontSize: 11 }}>{t.plate_number || t.vehicle_number || '—'}</span></td>
-      <td style={td}>{hsrp ? <Pill color={hsrp.color} bg={hsrp.bg}>{hsrp.label}</Pill> : <span style={{ color: T.textDim }}>—</span>}</td>
-      <td style={td}>{isTwoWheeler ? (helmet ? <Pill color={helmet.color} bg={helmet.bg}>{helmet.label}</Pill> : <span style={{ color: T.textDim }}>—</span>) : <span style={{ color: T.textDim }}>—</span>}</td>
-      <td style={td}>
-        {violation
-          ? <Pill color={T.red} bg={T.redDim}>{violation}</Pill>
-          : <Pill color={T.green} bg={T.greenDim}>✓ Clean</Pill>}
+      <td style={tdStyle}><span style={{ fontFamily: T.mono, fontSize: 11 }}>#{t.track_id ?? idx}</span></td>
+      <td style={tdStyle}>{vclass.charAt(0).toUpperCase() + vclass.slice(1)}</td>
+      <td style={tdStyle}><span style={{ fontFamily: T.mono, fontSize: 11 }}>{t.plate_number || t.vehicle_number || '—'}</span></td>
+      <td style={tdStyle}>{hsrp   ? <Pill color={hsrp.color}   bg={hsrp.bg}>{hsrp.label}</Pill>     : <span style={{ color: T.textDim }}>—</span>}</td>
+      <td style={tdStyle}>{isTwoWheeler
+        ? (helmet ? <Pill color={helmet.color} bg={helmet.bg}>{helmet.label}</Pill> : <span style={{ color: T.textDim }}>—</span>)
+        : <span style={{ color: T.textDim }}>—</span>}
       </td>
-      <td style={{ ...td, fontFamily: T.mono, fontSize: 11 }}>{(t.violation_confidence || t.quality_score || 0).toFixed(2)}</td>
-      <td style={{ ...td, fontFamily: T.mono, fontSize: 11 }}>{(t.quality_score || 0).toFixed(2)}</td>
-      <td style={td}>
+      <td style={tdStyle}>
+        {violation ? <Pill color={T.red} bg={T.redDim}>{violation}</Pill>
+                   : <Pill color={T.green} bg={T.greenDim}>✓ Clean</Pill>}
+      </td>
+      <td style={{ ...tdStyle, fontFamily: T.mono, fontSize: 11 }}>{(t.violation_confidence || t.quality_score || 0).toFixed(2)}</td>
+      <td style={{ ...tdStyle, fontFamily: T.mono, fontSize: 11 }}>{(t.quality_score || 0).toFixed(2)}</td>
+      <td style={tdStyle}>
         {stored
-          ? (review
-            ? <Pill color={T.amber} bg={T.amberDim}>⚠ Review</Pill>
-            : <Pill color={T.red}   bg={T.redDim}>Stored</Pill>)
+          ? (review ? <Pill color={T.amber} bg={T.amberDim}>⚠ Review</Pill>
+                    : <Pill color={T.red}   bg={T.redDim}>Stored</Pill>)
           : <span style={{ color: T.textDim }}>—</span>}
       </td>
-      <td style={{ ...td, fontFamily: T.mono, fontSize: 10, color: T.textDim }}>
+      <td style={{ ...tdStyle, fontFamily: T.mono, fontSize: 10, color: T.textDim }}>
         {t.first_frame ?? 0}–{t.last_frame ?? 0}
       </td>
     </tr>
   );
 }
 
-const td = {
-  padding: '10px 14px', fontSize: 12, verticalAlign: 'middle',
-  color: 'var(--text, #e5e5e5)',
-};
-
-const th = {
-  ...td, fontSize: 10, fontFamily: 'var(--font-mono, monospace)',
-  color: 'var(--text-dim, #555)', letterSpacing: '0.1em',
-  textTransform: 'uppercase', textAlign: 'left',
-  borderBottom: '1px solid var(--border, rgba(255,255,255,0.08))',
-  background: 'rgba(255,255,255,0.02)',
-  fontWeight: 500,
-};
-
 function TrackTable({ tracks }) {
   if (!tracks?.length) return (
-    <Card>
-      <div style={{ textAlign: 'center', color: T.textDim, fontSize: 13, padding: '20px 0' }}>
-        No tracks found in this video.
-      </div>
-    </Card>
+    <Card><div style={{ textAlign: 'center', color: T.textDim, fontSize: 13, padding: '20px 0' }}>No tracks found.</div></Card>
   );
-
   return (
     <Card noPad style={{ overflow: 'hidden' }}>
       <div style={{ padding: '14px 16px', borderBottom: `1px solid ${T.border}`, display: 'flex', alignItems: 'center', gap: 8 }}>
         <Layers size={14} color={T.accent} />
-        <span style={{ fontSize: 11, fontFamily: T.mono, color: T.textMuted, letterSpacing: '0.08em' }}>
+        <span style={{ fontSize: 11, fontFamily: T.mono, color: T.textMuted }}>
           TRACK-LEVEL RESULTS — {tracks.length} vehicles
         </span>
       </div>
@@ -365,7 +333,7 @@ function TrackTable({ tracks }) {
           <thead>
             <tr>
               {['Track', 'Vehicle', 'Plate', 'HSRP', 'Helmet', 'Violation', 'Conf.', 'Quality', 'Status', 'Frames'].map(h => (
-                <th key={h} style={th}>{h}</th>
+                <th key={h} style={thStyle}>{h}</th>
               ))}
             </tr>
           </thead>
@@ -382,32 +350,32 @@ function TrackTable({ tracks }) {
 
 function ViolationBreakdown({ byType }) {
   if (!byType || !Object.keys(byType).length) return null;
+  const maxCount = Math.max(...Object.values(byType).map(v => v.count));
   return (
     <Card>
-      <SectionLabel><BarChart2 size={11} style={{ verticalAlign: 'middle', marginRight: 6 }} />Violation Breakdown</SectionLabel>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        {Object.entries(byType).map(([k, v]) => {
-          const pct = Math.min(100, Math.round((v.count / Math.max(...Object.values(byType).map(x => x.count))) * 100));
-          return (
-            <div key={k}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
-                <span style={{ color: T.textMuted }}>{k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}</span>
-                <span style={{ fontFamily: T.mono, fontSize: 11 }}>
-                  {v.count} · <span style={{ color: T.textDim }}>avg conf {v.avg_conf?.toFixed(2)}</span>
-                </span>
-              </div>
-              <div style={{ height: 4, background: 'rgba(255,255,255,0.05)', borderRadius: 4, overflow: 'hidden' }}>
-                <div style={{ height: '100%', width: `${pct}%`, background: T.red, borderRadius: 4, transition: 'width 0.5s ease' }} />
-              </div>
+      <div style={{ fontSize: 10, fontFamily: T.mono, color: T.textDim, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 14 }}>
+        <BarChart2 size={11} style={{ verticalAlign: 'middle', marginRight: 6 }} />Violation Breakdown
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {Object.entries(byType).map(([k, v]) => (
+          <div key={k}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
+              <span style={{ color: T.textMuted }}>{k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}</span>
+              <span style={{ fontFamily: T.mono, fontSize: 11 }}>
+                {v.count} · <span style={{ color: T.textDim }}>avg {v.avg_conf?.toFixed(2)}</span>
+              </span>
             </div>
-          );
-        })}
+            <div style={{ height: 4, background: 'rgba(255,255,255,0.05)', borderRadius: 4, overflow: 'hidden' }}>
+              <div style={{ height: '100%', width: `${Math.round((v.count / maxCount) * 100)}%`, background: T.red, borderRadius: 4, transition: 'width 0.5s ease' }} />
+            </div>
+          </div>
+        ))}
       </div>
     </Card>
   );
 }
 
-// ── JSON download ─────────────────────────────────────────────────────────────
+// ── Download report button ────────────────────────────────────────────────────
 
 function DownloadReport({ result, jobId }) {
   function download() {
@@ -423,7 +391,6 @@ function DownloadReport({ result, jobId }) {
       padding: '9px 16px', borderRadius: 8,
       background: 'rgba(255,255,255,0.04)', border: `1px solid ${T.border}`,
       color: T.textMuted, cursor: 'pointer', fontSize: 12, fontFamily: T.mono,
-      transition: `all ${T.trans}`,
       marginBottom: 20,
     }}>
       <Download size={13} /> Download Full JSON Report
@@ -434,14 +401,14 @@ function DownloadReport({ result, jobId }) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
-  const { token }   = useAuth();
-  const [file, setFile]     = useState(null);
-  const [opts, setOpts]     = useState({ frameSkip: 1, saveVideo: true, annotateViolations: true, annotateNoViolations: false });
-  const [phase, setPhase]   = useState('idle');      // idle | uploading | processing | done | error
-  const [jobId, setJobId]   = useState(null);
+  const { token } = useAuth();
+  const [file, setFile]         = useState(null);
+  const [opts, setOpts]         = useState({ frameSkip: 1, saveVideo: true, annotateViolations: true, annotateNoViolations: false });
+  const [phase, setPhase]       = useState('idle');   // idle | uploading | processing | done | error
+  const [jobId, setJobId]       = useState(null);
   const [progress, setProgress] = useState({ done: 0, total: 0, fps: 0 });
-  const [result, setResult] = useState(null);
-  const [tracks, setTracks] = useState([]);
+  const [result, setResult]     = useState(null);
+  const [tracks, setTracks]     = useState([]);
   const [errorMsg, setErrorMsg] = useState('');
   const cancelRef = useRef(null);
 
@@ -456,34 +423,49 @@ export default function DashboardPage() {
 
   async function handleRun() {
     if (!file) return;
-    setPhase('uploading'); setErrorMsg('');
+    setPhase('uploading');
+    setErrorMsg('');
 
     try {
       const ocrMode =
         opts.annotateViolations && opts.annotateNoViolations ? 'always' :
-        opts.annotateViolations ? 'on_violation' :
-        opts.annotateNoViolations ? 'on_clean' : 'off';
+        opts.annotateViolations   ? 'on_violation' :
+        opts.annotateNoViolations ? 'on_clean'     : 'off';
 
       const resp = await uploadVideo(token, file, { ...opts, ocrMode });
-      if (!resp.job_id) throw new Error('No job_id returned');
+      if (!resp.job_id) throw new Error('No job_id returned from server');
 
-      setJobId(resp.job_id);
+      const id = resp.job_id;
+      setJobId(id);
       setPhase('processing');
 
       cancelRef.current = connectJobStream(
-        token, resp.job_id,
+        token,
+        id,
+        // onUpdate
         (data) => setProgress({ done: data.progress, total: data.total_frames, fps: data.fps }),
+        // onDone — WS says completed; now fetch results via REST (with retry)
         async () => {
-          const [r, t] = await Promise.all([
-            getJobResult(token, resp.job_id),
-            getJobTracks(token, resp.job_id),
-          ]);
-          setResult(r); setTracks(t.tracks || []); setPhase('done');
+          try {
+            const [r, t] = await Promise.all([
+              getJobResult(token, id),
+              getJobTracks(token, id),
+            ]);
+            setResult(r);
+            setTracks(t.tracks || []);
+            setPhase('done');
+          } catch (err) {
+            setErrorMsg(`Result fetch failed: ${err.message}`);
+            setPhase('error');
+          }
         },
+        // onError
         (err) => { setErrorMsg(err.message); setPhase('error'); }
       );
+
     } catch (err) {
-      setErrorMsg(err.message); setPhase('error');
+      setErrorMsg(err.message);
+      setPhase('error');
     }
   }
 
@@ -503,7 +485,7 @@ export default function DashboardPage() {
         </p>
       </div>
 
-      {/* ── Upload / error card ── */}
+      {/* ── Upload / error ── */}
       {(phase === 'idle' || phase === 'error') && (
         <Card style={{ animation: 'fadeIn 0.25s ease' }}>
           <UploadZone onFile={setFile} file={file} />
@@ -521,7 +503,8 @@ export default function DashboardPage() {
           )}
 
           <button
-            onClick={handleRun} disabled={!file}
+            onClick={handleRun}
+            disabled={!file}
             style={{
               marginTop: 18, width: '100%', padding: '13px',
               background: file ? T.accent : 'rgba(255,255,255,0.04)',
@@ -547,7 +530,7 @@ export default function DashboardPage() {
       {phase === 'done' && result && (
         <div style={{ animation: 'fadeIn 0.3s ease' }}>
 
-          {/* Reset button */}
+          {/* Completion banner + new video button */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <CheckCircle size={16} color={T.green} />
@@ -563,20 +546,21 @@ export default function DashboardPage() {
             </button>
           </div>
 
-          {/* Stat strip */}
+          {/* Stats */}
           <SummaryStrip summary={summary} meta={meta} />
 
-          {/* Annotated video */}
+          {/* Annotated video — only shown when saveVideo was checked */}
           {opts.saveVideo && <VideoPlayer jobId={jobId} />}
 
-          {/* Download report */}
+          {/* Download JSON */}
           <DownloadReport result={result} jobId={jobId} />
 
-          {/* Violation breakdown */}
+          {/* Violation breakdown chart */}
           <ViolationBreakdown byType={summary?.by_type} />
 
-          {/* Track table */}
+          {/* Per-track table */}
           <TrackTable tracks={tracks} />
+
         </div>
       )}
 

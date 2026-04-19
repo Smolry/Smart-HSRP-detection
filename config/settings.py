@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
 
+    # --- CORS orifgin list ---
+    CORS_ORIGINS: str
+
     # --- Business Rules ---
     HELMET_CONF_THRESHOLD: float
     HSRP_CONF_THRESHOLD: float = 0.5

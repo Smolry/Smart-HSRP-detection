@@ -1,11 +1,12 @@
 """
 API ROUTES
 ===========
-EC2 local storage version — S3 completely removed.
 
-Videos are saved to and served from the EC2 filesystem via FastAPI StaticFiles.
-- Input  → static/inputs/<job_id>.mp4  (cleaned up after processing)
-- Output → static/outputs/<job_id>.mp4 (served via /static/outputs/<job_id>.mp4)
+Local storage version — optimized for browser video playback.
+
+- Input  → static/inputs/<job_id>.mp4
+- Output → static/outputs/<job_id>.mp4
+- Served via → /api/job-video/<job_id>
 """
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form, WebSocket, WebSocketDisconnect, Query
@@ -14,10 +15,9 @@ import tempfile
 import os
 import json
 import asyncio
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 from typing import Optional
-from pathlib import Path
 import logging
 import time
 
@@ -39,16 +39,12 @@ from backend.utils.local_storage import (
     cleanup_input,
 )
 
-# ── Logging ─────────────────────────────────────
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Globals ─────────────────────────────────────
-
 router = APIRouter()
 redis_client: Optional[redis.Redis] = None
-executor = ProcessPoolExecutor(max_workers=2)
+executor = ThreadPoolExecutor(max_workers=2)
 
 # ── Redis Setup ─────────────────────────────────
 
@@ -77,19 +73,27 @@ async def job_get(job_id: str):
     data = await redis_client.hgetall(f"job:{job_id}")
     if not data:
         return None
-    return {
-        k: json.loads(v) if v.startswith("{") or v.startswith("[") else v
-        for k, v in data.items()
-    }
+    result = {}
+    for k, v in data.items():
+        try:
+            if v and (v.startswith("{") or v.startswith("[")):
+                result[k] = json.loads(v)
+            else:
+                result[k] = v
+        except:
+            result[k] = v
+    return result
 
 # ── Worker ─────────────────────────────────────
 
-def run_pipeline_sync(job_id, video_path, output_video_path,
+def run_pipeline_sync(job_id, tmp_path, output_video_path,
                       frame_skip, annotate_violations,
                       annotate_no_violations, ocr_mode):
 
     import redis as sync_redis
     import traceback
+
+    logger.info(f"[{job_id}] Worker started")
 
     r = sync_redis.Redis(
         host=os.getenv("REDIS_HOST", "localhost"),
@@ -108,7 +112,8 @@ def run_pipeline_sync(job_id, video_path, output_video_path,
         r.publish(channel, json.dumps(data))
 
     try:
-        # ── Progress callback ───────────────
+        video_path = save_input_video(tmp_path, job_id)
+
         def progress_cb(frames, total):
             elapsed = time.time() - start_time
             fps = frames / elapsed if elapsed > 0 else 0
@@ -119,9 +124,6 @@ def run_pipeline_sync(job_id, video_path, output_video_path,
                 "fps": round(fps, 2),
             })
 
-        # ── Run pipeline ────────────────────────────────────────────────
-        # process_video writes output to output_video_path on local disk.
-        # It returns output["video_url"] as the /static/outputs/<job_id>.mp4 URL.
         output = process_video(
             video_path=video_path,
             output_video_path=output_video_path,
@@ -133,24 +135,22 @@ def run_pipeline_sync(job_id, video_path, output_video_path,
             job_id=job_id,
         )
 
-        # ── Store violations in DB ──────────────────────────────────────
         if output.get("violations"):
             store_violations_batch(output["violations"])
 
         summary = generate_violation_summary(output)
-
-        # ── Local video URL (set by pipeline via get_video_url) ─────────
-        local_video_url = output.get("video_url") or get_video_url(job_id)
-
-        logger.info(f"[{job_id}] Output video available at: {local_video_url}")
+        video_url = output.get("video_url") or get_video_url(job_id)
 
         publish({
             "status": "completed",
             "summary": summary,
-            "video_url": local_video_url,
+            "metadata": output.get("metadata", {}),
+            "track_summaries": output.get("track_summaries", {}),
+            "video_url": video_url,
         })
 
     except Exception as e:
+        logger.error(f"[{job_id}] Error: {e}")
         publish({
             "status": "failed",
             "error": str(e),
@@ -158,16 +158,18 @@ def run_pipeline_sync(job_id, video_path, output_video_path,
         })
 
     finally:
-        # Clean up the raw input video to free space; output stays for serving
-        cleanup_input(job_id)
-        # Also clean up any leftover temp file
-        if video_path and os.path.exists(video_path):
-            try:
-                os.remove(video_path)
-            except Exception:
-                pass
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except:
+            pass
 
-# ── Upload Endpoint ─────────────────────────────
+        try:
+            cleanup_input(job_id)
+        except:
+            pass
+
+# ── Upload ─────────────────────────────────────
 
 @router.post("/process-video")
 async def process_video_endpoint(
@@ -180,33 +182,21 @@ async def process_video_endpoint(
 ):
     suffix = os.path.splitext(file.filename)[1] or ".mp4"
 
-    # ── Save uploaded file to a temp location ────────────────
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
     job_id = str(uuid4())
-
-    # ── Copy to static/inputs/<job_id>.mp4 for traceability ──
-    video_path = save_input_video(tmp_path, job_id)
-    os.remove(tmp_path)   # remove the original temp file
-
-    logger.info(f"[{job_id}] Input saved locally: {video_path}")
-
-    # ── Output path on EC2 disk ───────────────────────────────
     output_video_path = get_output_video_path(job_id) if save_output_video else None
 
-    await job_set(job_id, {
-        "status": "queued",
-        "input_video_path": video_path,
-    })
+    await job_set(job_id, {"status": "queued"})
 
     loop = asyncio.get_event_loop()
     loop.run_in_executor(
         executor,
         run_pipeline_sync,
         job_id,
-        video_path,
+        tmp_path,
         output_video_path,
         frame_skip,
         annotate_violations,
@@ -216,7 +206,7 @@ async def process_video_endpoint(
 
     return {"job_id": job_id}
 
-# ── WebSocket ─────────────────────────────────────────────────────────────────
+# ── WebSocket ─────────────────────────────────
 
 @router.websocket("/ws/{job_id}")
 async def websocket_progress(websocket: WebSocket, job_id: str):
@@ -225,60 +215,67 @@ async def websocket_progress(websocket: WebSocket, job_id: str):
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(f"job_progress:{job_id}")
 
+    job = await job_get(job_id)
+    if job and job.get("status") == "completed":
+        await websocket.send_text(json.dumps({"status": "completed", **job}))
+        return
+
     try:
         while True:
             message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             if message:
                 await websocket.send_text(message["data"])
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected: {job_id}")
-
+        pass
     finally:
         await pubsub.unsubscribe(f"job_progress:{job_id}")
         await pubsub.close()
 
-# ── Job Result ────────────────────────────────────────────────────────────────
+
+# ── Job Result ───────────────────────────────────────────────────────────────
 
 @router.get("/job-result/{job_id}")
 async def job_result(job_id: str):
     job = await job_get(job_id)
-
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     if job.get("status") == "failed":
         raise HTTPException(status_code=500, detail=job)
-
     if job.get("status") != "completed":
         raise HTTPException(status_code=400, detail="Job not completed yet")
-
     return job
 
-# ── Job Video — served directly from EC2 disk ─────────────────────────────────
+# ── Job Video ───────────────────────────────────────────────────────────────
 
 @router.get("/job-video/{job_id}")
 async def job_video(job_id: str):
-    job = await job_get(job_id)
-    if not job or job.get("status") != "completed":
-        raise HTTPException(status_code=404, detail="Video not available")
-
     if not output_video_exists(job_id):
-        raise HTTPException(status_code=404, detail="Video file not found on disk")
+        raise HTTPException(status_code=404, detail="Video not found")
 
     path = get_output_video_path(job_id)
-    return FileResponse(path, media_type="video/mp4", filename=f"output_{job_id}.mp4")
 
-# ── Violations ────────────────────────────────────────────────────────────────
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=f"{job_id}.mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Type": "video/mp4",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+# ── Violations ───────────────────────────────────────────────────────────────
 
 @router.get("/violations")
 async def list_violations(
-    limit:          int   = Query(200, ge=1, le=1000),
-    offset:         int   = Query(0, ge=0),
+    limit:          int            = Query(200, ge=1, le=1000),
+    offset:         int            = Query(0, ge=0),
     violation_type: Optional[str]  = Query(None),
     needs_review:   Optional[bool] = Query(None),
-    min_quality:    float = Query(0.0, ge=0.0, le=1.0),
+    min_quality:    float          = Query(0.0, ge=0.0, le=1.0),
 ):
     rows = get_violations(
         limit=limit, offset=offset,
@@ -303,7 +300,7 @@ async def get_violation(violation_id: int):
     finally:
         db_gen.close()
 
-# ── Track summaries ───────────────────────────────────────────────────────────
+# ── Track summaries ──────────────────────────────────────────────────────────
 
 @router.get("/job-tracks/{job_id}")
 async def job_tracks(job_id: str):
@@ -311,15 +308,19 @@ async def job_tracks(job_id: str):
     if not job or job.get("status") != "completed":
         raise HTTPException(status_code=404, detail="Job not ready")
     track_summaries = job.get("track_summaries", {})
+    if isinstance(track_summaries, str):
+        try:
+            track_summaries = json.loads(track_summaries)
+        except Exception:
+            track_summaries = {}
     tracks = sorted(track_summaries.values(), key=lambda t: t.get("first_frame", 0))
     return {"job_id": job_id, "tracks": tracks, "count": len(tracks)}
 
-# ── Adaptive thresholds ───────────────────────────────────────────────────────
+# ── Adaptive thresholds ──────────────────────────────────────────────────────
 
 @router.get("/thresholds")
 async def get_thresholds():
     return load_threshold_state()
-
 
 @router.post("/thresholds/reset")
 async def reset_thresholds():
@@ -327,7 +328,7 @@ async def reset_thresholds():
     save_threshold_state(defaults)
     return {"status": "reset", "thresholds": defaults}
 
-# ── Legacy ────────────────────────────────────────────────────────────────────
+# ── Legacy ───────────────────────────────────────────────────────────────────
 
 @router.get("/job-legacy-result/{job_id}")
 async def legacy_result(job_id: str):
