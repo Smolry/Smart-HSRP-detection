@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>HSRP Live Capture</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0a0a10;
+      color: #e5e5e5;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      overflow-x: hidden;
+    }
+
+    header {
+      width: 100%;
+      padding: 12px 16px;
+      background: #111118;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    header h1 { font-size: 14px; font-weight: 700; letter-spacing: -0.02em; }
+
+    #conn-badge {
+      font-size: 10px; font-family: monospace;
+      padding: 3px 9px; border-radius: 20px;
+      background: rgba(239,68,68,0.15); color: #ef4444;
+      border: 1px solid rgba(239,68,68,0.3); transition: all 0.2s;
+    }
+    #conn-badge.connected  { background: rgba(34,197,94,0.12);  color: #22c55e; border-color: rgba(34,197,94,0.3); }
+    #conn-badge.connecting { background: rgba(245,158,11,0.12); color: #f59e0b; border-color: rgba(245,158,11,0.3); }
+
+    .preview-wrapper {
+      width: 100%; max-width: 480px;
+      position: relative; background: #000;
+    }
+
+    #preview {
+      width: 100%; display: block;
+      aspect-ratio: 4/3; object-fit: cover;
+    }
+
+    /* Buffer warning overlay */
+    #buffer-overlay {
+      position: absolute; top: 8px; left: 8px;
+      background: rgba(245,158,11,0.92); color: #000;
+      font-size: 10px; font-family: monospace; font-weight: 700;
+      padding: 3px 8px; border-radius: 4px; display: none;
+    }
+    #buffer-overlay.visible { display: block; }
+
+    /* Critical buffer warning */
+    #buffer-overlay.critical { background: rgba(239,68,68,0.95); color: #fff; }
+
+    .violation-flash {
+      position: absolute; inset: 0; pointer-events: none;
+      border: 3px solid #ef4444; opacity: 0; transition: opacity 0.15s;
+    }
+    .violation-flash.active { opacity: 1; }
+
+    canvas { display: none; }
+
+    /* Buffer depth bar */
+    .buffer-bar-wrap {
+      width: 100%; max-width: 480px;
+      background: #0d0d14; padding: 6px 12px;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .buffer-bar-label {
+      display: flex; justify-content: space-between;
+      font-size: 9px; font-family: monospace; color: #555;
+      text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px;
+    }
+    .buffer-bar-track {
+      height: 4px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden;
+    }
+    .buffer-bar-fill {
+      height: 100%; width: 0%; border-radius: 4px;
+      background: #22c55e; transition: width 0.3s, background 0.3s;
+    }
+
+    .stats-bar {
+      width: 100%; max-width: 480px;
+      display: grid; grid-template-columns: repeat(4, 1fr);
+      gap: 1px; background: rgba(255,255,255,0.06);
+    }
+    .stat { background: #0d0d14; padding: 8px 4px; text-align: center; }
+    .stat-label {
+      font-size: 9px; font-family: monospace; color: #555;
+      letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 3px;
+    }
+    .stat-value { font-size: 16px; font-weight: 800; font-family: monospace; color: #e5e5e5; }
+    .stat-value.warn { color: #f59e0b; }
+    .stat-value.crit { color: #ef4444; }
+    .stat-value.good { color: #22c55e; }
+
+    .controls {
+      width: 100%; max-width: 480px;
+      padding: 16px; display: flex; flex-direction: column; gap: 10px;
+    }
+
+    #start-btn {
+      width: 100%; padding: 15px; border-radius: 12px; border: none;
+      font-size: 15px; font-weight: 700; cursor: pointer; transition: all 0.18s;
+      background: #7c3aed; color: #fff; letter-spacing: -0.01em;
+    }
+    #start-btn.streaming { background: #dc2626; }
+    #start-btn:disabled  { opacity: 0.4; cursor: not-allowed; }
+
+    .log { font-size: 10px; font-family: monospace; color: #444; min-height: 20px; text-align: center; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🚗 HSRP Live Capture</h1>
+  <div id="conn-badge">DISCONNECTED</div>
+</header>
+
+<div class="preview-wrapper">
+  <video id="preview" autoplay playsinline muted></video>
+  <div id="buffer-overlay">⚡ BUFFERING: 0 frames</div>
+  <div class="violation-flash" id="viol-flash"></div>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<!-- Send-buffer depth indicator -->
+<div class="buffer-bar-wrap">
+  <div class="buffer-bar-label">
+    <span>SEND BUFFER</span>
+    <span id="buf-label">0 frames queued</span>
+  </div>
+  <div class="buffer-bar-track">
+    <div class="buffer-bar-fill" id="buf-fill"></div>
+  </div>
+</div>
+
+<div class="stats-bar">
+  <div class="stat">
+    <div class="stat-label">CAP FPS</div>
+    <div class="stat-value" id="stat-cap">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">PROC FPS</div>
+    <div class="stat-value" id="stat-proc">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">BUFFERED</div>
+    <div class="stat-value" id="stat-buf">0</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">VIOLATIONS</div>
+    <div class="stat-value" id="stat-viol">0</div>
+  </div>
+</div>
+
+<div class="controls">
+  <button id="start-btn" disabled>Start Streaming</button>
+  <div class="log" id="log">Requesting camera…</div>
+</div>
+
+<script>
+  // ── Config ─────────────────────────────────────────────────────────────────
+  const WS_URL            = `ws://${location.host}/api/stream`;
+  const CAPTURE_INTERVAL  = 100;     // capture at 10fps into local buffer
+  const JPEG_QUALITY      = 0.70;
+  const MAX_SEND_BUFFER   = 300;     // ~30s at 10fps — hard cap, warn operator
+
+  // ── DOM refs ───────────────────────────────────────────────────────────────
+  const preview    = document.getElementById('preview');
+  const canvas     = document.getElementById('canvas');
+  const ctx        = canvas.getContext('2d');
+  const startBtn   = document.getElementById('start-btn');
+  const connBadge  = document.getElementById('conn-badge');
+  const bufOverlay = document.getElementById('buffer-overlay');
+  const violFlash  = document.getElementById('viol-flash');
+  const bufFill    = document.getElementById('buf-fill');
+  const bufLabel   = document.getElementById('buf-label');
+  const statCap    = document.getElementById('stat-cap');
+  const statProc   = document.getElementById('stat-proc');
+  const statBuf    = document.getElementById('stat-buf');
+  const statViol   = document.getElementById('stat-viol');
+  const logEl      = document.getElementById('log');
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  let ws           = null;
+  let streaming    = false;
+  let captureTimer = null;
+  let sendTimer    = null;
+  let totalViol    = 0;
+  let sending      = false;  // true while a ws.send is in progress
+
+  // Phone-side send buffer — every captured frame goes here first
+  // The drain loop sends from this buffer as fast as WS allows
+  const sendBuffer = [];
+
+  // FPS tracking
+  let capFrames  = 0;
+  let lastCapTs  = Date.now();
+
+  // ── Camera init ────────────────────────────────────────────────────────────
+  async function initCamera() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: false,
+      });
+      preview.srcObject = stream;
+      await preview.play();
+      log('Camera ready ✓');
+      startBtn.disabled = false;
+    } catch (err) {
+      log(`Camera error: ${err.message}`);
+    }
+  }
+
+  // ── Capture loop — pushes JPEG blobs into sendBuffer ──────────────────────
+  function captureFrame() {
+    if (!streaming) return;
+
+    if (sendBuffer.length >= MAX_SEND_BUFFER) {
+      // Buffer at hard cap — warn operator, skip capture this tick
+      log(`⚠️ Buffer full (${MAX_SEND_BUFFER} frames) — GPU very far behind!`);
+      return;
+    }
+
+    const vw = preview.videoWidth  || 640;
+    const vh = preview.videoHeight || 480;
+    canvas.width  = vw;
+    canvas.height = vh;
+    ctx.drawImage(preview, 0, 0, vw, vh);
+
+    canvas.toBlob(blob => {
+      if (!blob || !streaming) return;
+      sendBuffer.push(blob);
+
+      // Track capture FPS
+      capFrames++;
+      const now     = Date.now();
+      const elapsed = (now - lastCapTs) / 1000;
+      if (elapsed >= 1.0) {
+        statCap.textContent = (capFrames / elapsed).toFixed(1);
+        capFrames = 0;
+        lastCapTs = now;
+      }
+
+      updateBufferUI();
+    }, 'image/jpeg', JPEG_QUALITY);
+  }
+
+  // ── Send drain loop — empties sendBuffer into WebSocket as fast as possible
+  // We don't rate-limit this — WebSocket flow control is the natural throttle.
+  // When GPU is fast: buffer empties quickly.
+  // When GPU is slow: buffer grows, phone UI shows backpressure.
+  async function drainSendBuffer() {
+    while (streaming) {
+      if (sendBuffer.length === 0 || !ws || ws.readyState !== WebSocket.OPEN) {
+        await sleep(10);
+        continue;
+      }
+
+      const blob = sendBuffer.shift();
+      updateBufferUI();
+
+      try {
+        ws.send(blob);
+      } catch (e) {
+        // WS not ready — put frame back and wait
+        sendBuffer.unshift(blob);
+        await sleep(50);
+      }
+
+      // Small yield so browser can handle incoming messages between sends
+      await sleep(0);
+    }
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function updateBufferUI() {
+    const depth  = sendBuffer.length;
+    const pct    = Math.min((depth / MAX_SEND_BUFFER) * 100, 100);
+
+    statBuf.textContent = depth;
+    bufLabel.textContent = `${depth} frame${depth !== 1 ? 's' : ''} queued`;
+
+    bufFill.style.width = pct + '%';
+    bufFill.style.background =
+      pct > 80 ? '#ef4444' :
+      pct > 50 ? '#f59e0b' : '#22c55e';
+
+    statBuf.className = 'stat-value' + (pct > 80 ? ' crit' : pct > 50 ? ' warn' : ' good');
+
+    if (depth > MAX_SEND_BUFFER * 0.8) {
+      bufOverlay.textContent  = `⚡ BUFFERING: ${depth} frames`;
+      bufOverlay.className    = depth >= MAX_SEND_BUFFER ? 'visible critical' : 'visible';
+    } else {
+      bufOverlay.className = '';
+    }
+  }
+
+  // ── WebSocket ──────────────────────────────────────────────────────────────
+  function connect() {
+    setConnState('connecting');
+    log('Connecting to server…');
+
+    ws = new WebSocket(WS_URL);
+    ws.binaryType = 'blob';
+
+    ws.onopen = () => {
+      setConnState('connected');
+      log('Connected ✓ — streaming');
+      // Start capture and drain loops
+      captureTimer = setInterval(captureFrame, CAPTURE_INTERVAL);
+      drainSendBuffer(); // runs until streaming=false
+    };
+
+    ws.onmessage = (event) => {
+      if (typeof event.data !== 'string') return;
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'ack') {
+          // Server acknowledged a frame — shows server-side queue depth
+          // (this is the intake_queue on the server, different from sendBuffer)
+          // We don't need to do anything here — sendBuffer already shows phone side
+        } else if (msg.type === 'frame') {
+          // Processed frame metadata
+          statProc.textContent = msg.fps ?? '—';
+          if (msg.violations && msg.violations.length > 0) {
+            totalViol += msg.violations.length;
+            statViol.textContent = totalViol;
+            flashViolation();
+          }
+        }
+      } catch {}
+    };
+
+    ws.onerror = () => log('WebSocket error');
+
+    ws.onclose = () => {
+      setConnState('disconnected');
+      clearInterval(captureTimer);
+      if (streaming) {
+        log('Disconnected. Reconnecting in 2s…');
+        // Keep sendBuffer — don't lose frames across reconnect
+        setTimeout(() => { if (streaming) connect(); }, 2000);
+      } else {
+        log('Stopped.');
+      }
+    };
+  }
+
+  function disconnect() {
+    clearInterval(captureTimer);
+    streaming = false;
+    if (ws) {
+      ws.onclose = null;
+      ws.close();
+      ws = null;
+    }
+    sendBuffer.length = 0;
+    updateBufferUI();
+    setConnState('disconnected');
+  }
+
+  // ── UI helpers ─────────────────────────────────────────────────────────────
+  function setConnState(state) {
+    connBadge.className   = state === 'connected' ? 'connected' : state === 'connecting' ? 'connecting' : '';
+    connBadge.textContent = state.toUpperCase();
+  }
+
+  function log(msg) { logEl.textContent = msg; }
+
+  let violTimer = null;
+  function flashViolation() {
+    violFlash.classList.add('active');
+    clearTimeout(violTimer);
+    violTimer = setTimeout(() => violFlash.classList.remove('active'), 600);
+  }
+
+  // ── Start / Stop ───────────────────────────────────────────────────────────
+  startBtn.addEventListener('click', () => {
+    if (streaming) {
+      streaming = false;
+      startBtn.textContent = 'Start Streaming';
+      startBtn.classList.remove('streaming');
+      disconnect();
+    } else {
+      streaming = true;
+      startBtn.textContent = 'Stop Streaming';
+      startBtn.classList.add('streaming');
+      totalViol = 0;
+      statViol.textContent = '0';
+      connect();
+    }
+  });
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+  initCamera();
+</script>
+</body>
+</html>

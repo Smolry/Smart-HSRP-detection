@@ -1,9 +1,9 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, memo } from 'react';
 import { useAuth } from '../hooks/useAuth';
-import { uploadVideo, connectJobStream, getJobResult, getJobTracks, getVideoUrl } from '../services/api';
+import { uploadVideo, connectJobStream, getJobResult, getJobTracks, getVideoUrl, connectViewerStream } from '../services/api';
 import {
   Upload, Play, CheckCircle, AlertCircle, ChevronDown, ChevronUp,
-  Film, Download, RefreshCw, BarChart2, Layers,
+  Film, Download, RefreshCw, BarChart2, Layers, Radio, Wifi, WifiOff,
 } from 'lucide-react';
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ function ProgressCard({ phase, progress }) {
         </span>
         {!isUploading && (
           <span style={{ fontSize: 11, fontFamily: T.mono, color: T.textDim }}>
-            {progress.done} / {progress.total || '?'}{progress.fps > 0 ? ` · ${progress.fps} fps` : ''}
+            {progress.done}{progress.total > 0 ? ` / ${progress.total}` : ''}{progress.fps > 0 ? ` · ${progress.fps} fps` : ''}
           </span>
         )}
       </div>
@@ -216,7 +216,16 @@ function VideoPlayer({ jobId }) {
       <video
         key={jobId}
         controls
+        playsInline
+        preload="metadata"
         style={{ width: '100%', display: 'block', maxHeight: 420, background: '#000' }}
+        ref={el => {
+          if (el) {
+            // Suppress the play/pause race AbortError — it's harmless
+            const p = el.play();
+            if (p) p.catch(() => {});
+          }
+        }}
       >
         <source src={url} type="video/mp4" />
       </video>
@@ -239,7 +248,7 @@ function VideoPlayer({ jobId }) {
 function SummaryStrip({ summary, meta }) {
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
-      <StatCard label="FRAMES PROCESSED" value={meta?.total_frames_processed ?? '—'} accent={T.accent} />
+      <StatCard label="FRAMES PROCESSED" value={meta?.total_frames_processed ?? meta?.total_frames_read ?? '—'} accent={T.accent} />
       <StatCard label="AVG FPS"           value={meta?.avg_fps              ?? '—'} accent="#6366f1" />
       <StatCard label="VIOLATIONS FOUND"  value={summary?.total             ?? 0}   accent={T.red}   />
       <StatCard label="NEEDS REVIEW"      value={summary?.needs_review      ?? 0}   accent={T.amber} />
@@ -398,10 +407,298 @@ function DownloadReport({ result, jobId }) {
   );
 }
 
+// ── Live stream tab ───────────────────────────────────────────────────────────
+
+function LiveStatCard({ label, value, accent }) {
+  return (
+    <div style={{
+      background: T.card, border: `1px solid ${T.border}`,
+      borderRadius: 12, padding: '14px 18px',
+      borderTop: `2px solid ${accent || T.accent}`,
+      minWidth: 0,
+    }}>
+      <div style={{ fontSize: 10, color: T.textDim, fontFamily: T.mono, marginBottom: 5, letterSpacing: '0.08em' }}>{label}</div>
+      <div style={{ fontSize: 24, fontWeight: 800, fontFamily: T.display, lineHeight: 1 }}>{value ?? '—'}</div>
+    </div>
+  );
+}
+
+function StatusDot({ state }) {
+  const cfg = {
+    connected:    { color: T.green,  label: 'LIVE' },
+    connecting:   { color: T.amber,  label: 'CONNECTING…' },
+    reconnecting: { color: T.amber,  label: 'RECONNECTING…' },
+    disconnected: { color: T.textDim, label: 'DISCONNECTED' },
+    error:        { color: T.red,    label: 'ERROR' },
+  }[state] || { color: T.textDim, label: state?.toUpperCase() };
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+      <span style={{
+        width: 8, height: 8, borderRadius: '50%',
+        background: cfg.color,
+        boxShadow: state === 'connected' ? `0 0 6px ${cfg.color}` : 'none',
+        animation: state === 'connected' ? 'livePulse 2s ease infinite' : 'none',
+      }} />
+      <span style={{ fontSize: 11, fontFamily: T.mono, color: cfg.color, letterSpacing: '0.06em' }}>
+        {cfg.label}
+      </span>
+      <style>{`@keyframes livePulse { 0%,100%{opacity:1} 50%{opacity:0.5} }`}</style>
+    </div>
+  );
+}
+
+function LiveTrackRow({ t, idx }) {
+  const vclass = (t.vehicle_class || 'vehicle').toLowerCase();
+  const isMoto = ['motorcycle', 'bicycle', 'bike'].includes(vclass);
+
+  const hsrpPill = t.hsrp === 'hsrp'
+    ? <Pill color={T.green} bg={T.greenDim}>HSRP</Pill>
+    : t.hsrp === 'non_hsrp'
+    ? <Pill color={T.red} bg={T.redDim}>Non-HSRP</Pill>
+    : <span style={{ color: T.textDim }}>—</span>;
+
+  const helmetPill = !isMoto ? <span style={{ color: T.textDim }}>—</span>
+    : t.helmet === 'HELMET' ? <Pill color={T.green} bg={T.greenDim}>Helmet</Pill>
+    : t.helmet === 'NO_HELMET' ? <Pill color={T.red} bg={T.redDim}>No Helmet</Pill>
+    : <span style={{ color: T.textDim }}>—</span>;
+
+  return (
+    <tr style={{ borderBottom: `1px solid ${T.border}` }}>
+      <td style={tdStyle}><span style={{ fontFamily: T.mono, fontSize: 11 }}>#{t.track_id ?? idx}</span></td>
+      <td style={tdStyle}>{vclass.charAt(0).toUpperCase() + vclass.slice(1)}</td>
+      <td style={tdStyle}><span style={{ fontFamily: T.mono, fontSize: 11 }}>{t.ocr_text || '—'}</span></td>
+      <td style={tdStyle}>{hsrpPill}</td>
+      <td style={tdStyle}>{helmetPill}</td>
+    </tr>
+  );
+}
+
+function BufferBar({ current, target, label }) {
+  const pct   = target > 0 ? Math.min((current / target) * 100, 100) : 0;
+  const color  = pct > 80 ? T.red : pct > 40 ? T.amber : T.green;
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, fontFamily: T.mono, color: T.textDim, marginBottom: 5 }}>
+        <span style={{ letterSpacing: '0.08em', textTransform: 'uppercase' }}>{label}</span>
+        <span style={{ color }}>{current} / {target} frames</span>
+      </div>
+      <div style={{ height: 4, background: 'rgba(255,255,255,0.05)', borderRadius: 4, overflow: 'hidden' }}>
+        <div style={{ height: '100%', width: `${pct}%`, background: color, borderRadius: 4, transition: 'width 0.3s, background 0.3s' }} />
+      </div>
+    </div>
+  );
+}
+
+function LiveTab() {
+  const [status, setStatus]           = useState('disconnected');
+  const [frameUrl, setFrameUrl]       = useState(null);
+  const [meta, setMeta]               = useState(null);
+  const [tracks, setTracks]           = useState([]);
+  const [violCount, setViolCount]     = useState(0);
+  const [bufferingInfo, setBuffering] = useState(null);  // {buffer_frames, buffer_target} | null
+  const cancelRef                     = useRef(null);
+  const EC2_IP = process.env.REACT_APP_EC2_IP || window.location.hostname;
+
+  function connect() {
+    if (cancelRef.current) cancelRef.current();
+    cancelRef.current = connectViewerStream({
+      onFrame: (url) => {
+        setFrameUrl(url);
+        setBuffering(null);  // clear buffering indicator once frames arrive
+      },
+      onMeta: (msg) => {
+        if (msg.type === 'buffering') {
+          setBuffering({ buffer_frames: msg.buffer_frames, buffer_target: msg.buffer_target });
+          return;
+        }
+        if (msg.type !== 'frame') return;
+        setMeta(msg);
+        setBuffering(null);
+        if (msg.tracks) setTracks(msg.tracks);
+        if (msg.violations?.length) setViolCount(v => v + msg.violations.length);
+      },
+      onStatusChange: setStatus,
+    });
+  }
+
+  function disconnect() {
+    cancelRef.current?.();
+    cancelRef.current = null;
+    setStatus('disconnected');
+    setBuffering(null);
+  }
+
+  useEffect(() => () => cancelRef.current?.(), []);
+
+  const isConnected  = status === 'connected' || status === 'reconnecting';
+  const isBuffering  = !!bufferingInfo;
+  const viewerBuf    = meta?.viewer_buffer_frames ?? 0;
+  const serverQueue  = meta?.queue_depth          ?? 0;
+
+  return (
+    <div>
+      {/* Header row */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
+        <StatusDot state={status} />
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          <a
+            href={`http://${EC2_IP}/api/capture`}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              fontSize: 11, fontFamily: T.mono, color: T.textMuted,
+              padding: '6px 12px', borderRadius: 7,
+              border: `1px solid ${T.border}`, textDecoration: 'none',
+              display: 'flex', alignItems: 'center', gap: 5,
+            }}
+          >
+            📱 Phone capture page
+          </a>
+          <button
+            onClick={isConnected ? disconnect : connect}
+            style={{
+              padding: '7px 16px', borderRadius: 8, border: 'none',
+              background: isConnected ? T.redDim : T.accent,
+              color: isConnected ? T.red : '#fff',
+              fontFamily: T.display, fontSize: 12, fontWeight: 700,
+              cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
+            }}
+          >
+            {isConnected ? <><WifiOff size={12} /> Disconnect</> : <><Wifi size={12} /> Connect</>}
+          </button>
+        </div>
+      </div>
+
+      {/* Stats strip */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 14 }}>
+        <LiveStatCard label="PROC FPS"      value={meta?.fps              ?? '—'} accent={T.accent} />
+        <LiveStatCard label="FRAMES PROC"   value={meta?.frames_processed ?? '—'} accent="#6366f1"  />
+        <LiveStatCard label="ACTIVE TRACKS" value={meta?.active_tracks    ?? '—'} accent={T.amber}  />
+        <LiveStatCard label="VIOLATIONS"    value={violCount}                      accent={T.red}    />
+      </div>
+
+      {/* Buffer indicators — only shown when there's something to show */}
+      {isConnected && (serverQueue > 0 || viewerBuf > 0 || isBuffering) && (
+        <Card style={{ padding: '16px 20px', marginBottom: 14 }}>
+          {serverQueue > 0 && (
+            <BufferBar
+              label="Server intake queue (GPU backlog)"
+              current={serverQueue}
+              target={Math.max(serverQueue, 30)}
+            />
+          )}
+          <BufferBar
+            label="Viewer playback buffer"
+            current={isBuffering ? (bufferingInfo.buffer_frames ?? 0) : viewerBuf}
+            target={isBuffering ? (bufferingInfo.buffer_target ?? 8) : Math.max(viewerBuf, 8)}
+          />
+        </Card>
+      )}
+
+      {/* Live frame */}
+      <Card noPad style={{ overflow: 'hidden', marginBottom: 18 }}>
+        <div style={{
+          padding: '10px 16px', borderBottom: `1px solid ${T.border}`,
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          <Radio size={13} color={isConnected && !isBuffering ? T.red : T.textDim} />
+          <span style={{ fontSize: 11, fontFamily: T.mono, color: T.textMuted, letterSpacing: '0.08em' }}>
+            ANNOTATED FEED
+          </span>
+          {serverQueue > 10 && (
+            <span style={{ marginLeft: 'auto', fontSize: 10, fontFamily: T.mono, color: T.amber }}>
+              ⏳ {serverQueue} frames queued on GPU
+            </span>
+          )}
+        </div>
+
+        {/* Buffering spinner overlay */}
+        {isBuffering && (
+          <div style={{
+            height: 280, display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'center',
+            background: '#000', gap: 14,
+          }}>
+            <div style={{ fontSize: 22 }}>⏳</div>
+            <div style={{ fontSize: 13, color: T.textMuted }}>
+              Buffering… {bufferingInfo.buffer_frames ?? 0} / {bufferingInfo.buffer_target ?? 8} frames
+            </div>
+            <div style={{ width: 200, height: 4, background: 'rgba(255,255,255,0.06)', borderRadius: 4, overflow: 'hidden' }}>
+              <div style={{
+                height: '100%',
+                width: `${Math.round(((bufferingInfo.buffer_frames ?? 0) / (bufferingInfo.buffer_target ?? 8)) * 100)}%`,
+                background: `linear-gradient(90deg, ${T.accent}, #a855f7)`,
+                borderRadius: 4, transition: 'width 0.3s',
+              }} />
+            </div>
+            <div style={{ fontSize: 10, color: T.textDim, fontFamily: T.mono }}>
+              waiting for GPU to process frames…
+            </div>
+          </div>
+        )}
+
+        {/* Live frame image */}
+        {!isBuffering && frameUrl && (
+          <img
+            src={frameUrl}
+            alt="Live annotated feed"
+            style={{ width: '100%', display: 'block', maxHeight: 440, objectFit: 'contain', background: '#000' }}
+          />
+        )}
+
+        {/* Idle / waiting state */}
+        {!isBuffering && !frameUrl && (
+          <div style={{
+            height: 280, display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'center',
+            color: T.textDim, fontSize: 13, gap: 10, background: '#000',
+          }}>
+            <Radio size={28} color={T.textDim} />
+            <span>
+              {status === 'disconnected' ? 'Click Connect to start watching' :
+               status === 'connecting'   ? 'Connecting…' :
+               status === 'connected'    ? 'Waiting for phone to send frames…' :
+               'Reconnecting…'}
+            </span>
+          </div>
+        )}
+      </Card>
+
+      {/* Live track table */}
+      {tracks.length > 0 && (
+        <Card noPad style={{ overflow: 'hidden' }}>
+          <div style={{ padding: '12px 16px', borderBottom: `1px solid ${T.border}`, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Layers size={13} color={T.accent} />
+            <span style={{ fontSize: 11, fontFamily: T.mono, color: T.textMuted }}>
+              ACTIVE TRACKS — {tracks.length} vehicles
+            </span>
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr>
+                  {['Track', 'Vehicle', 'Plate', 'HSRP', 'Helmet'].map(h => (
+                    <th key={h} style={thStyle}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {tracks.map((t, i) => <LiveTrackRow key={t.track_id ?? i} t={t} idx={i} />)}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
   const { token } = useAuth();
+  const [tab, setTab]               = useState('upload');  // 'upload' | 'live'
   const [file, setFile]         = useState(null);
   const [opts, setOpts]         = useState({ frameSkip: 1, saveVideo: true, annotateViolations: true, annotateNoViolations: false });
   const [phase, setPhase]       = useState('idle');   // idle | uploading | processing | done | error
@@ -472,20 +769,38 @@ export default function DashboardPage() {
   const summary = result?.summary  || {};
   const meta    = result?.metadata || {};
 
+  const TAB_STYLE = (active) => ({
+    padding: '8px 18px', borderRadius: 8, border: 'none',
+    background: active ? T.accent : 'transparent',
+    color: active ? '#fff' : T.textMuted,
+    cursor: 'pointer', fontSize: 13, fontWeight: active ? 700 : 400,
+    fontFamily: T.display, display: 'flex', alignItems: 'center', gap: 6,
+    transition: `all ${T.trans}`,
+  });
+
   return (
     <div style={{ padding: '32px 40px', maxWidth: 980 }}>
 
-      {/* Header */}
-      <div style={{ marginBottom: 28 }}>
-        <h1 style={{ fontFamily: T.display, fontSize: 26, fontWeight: 800, letterSpacing: '-0.03em', marginBottom: 4 }}>
-          Video Analysis
+      {/* Header + tabs */}
+      <div style={{ marginBottom: 24 }}>
+        <h1 style={{ fontFamily: T.display, fontSize: 26, fontWeight: 800, letterSpacing: '-0.03em', marginBottom: 16 }}>
+          HSRP Monitoring System
         </h1>
-        <p style={{ color: T.textMuted, fontSize: 13 }}>
-          Upload traffic footage to detect HSRP violations and helmet non-compliance.
-        </p>
+        <div style={{ display: 'flex', gap: 4, background: 'rgba(255,255,255,0.03)', border: `1px solid ${T.border}`, borderRadius: 10, padding: 4, width: 'fit-content' }}>
+          <button style={TAB_STYLE(tab === 'upload')} onClick={() => setTab('upload')}>
+            <Film size={13} /> Upload Video
+          </button>
+          <button style={TAB_STYLE(tab === 'live')} onClick={() => setTab('live')}>
+            <Radio size={13} /> Live Stream
+          </button>
+        </div>
       </div>
 
-      {/* ── Upload / error ── */}
+      {/* ── LIVE TAB ── */}
+      {tab === 'live' && <LiveTab />}
+
+      {/* ── UPLOAD TAB ── */}
+      {tab === 'upload' && (<>
       {(phase === 'idle' || phase === 'error') && (
         <Card style={{ animation: 'fadeIn 0.25s ease' }}>
           <UploadZone onFile={setFile} file={file} />
@@ -563,6 +878,8 @@ export default function DashboardPage() {
 
         </div>
       )}
+
+      </>)} {/* end upload tab */}
 
     </div>
   );

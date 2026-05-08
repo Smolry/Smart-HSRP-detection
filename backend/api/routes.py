@@ -7,7 +7,7 @@ WebSocket uses async pubsub.listen() — no timeout polling issues on Windows.
 """
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 import tempfile
 import os
 import json
@@ -30,6 +30,7 @@ from backend.utils.local_storage import (
     save_input_video, get_output_video_path, get_video_url,
     output_video_exists, cleanup_input,
 )
+from backend.api.live_stream import handle_phone_stream, handle_viewer_stream
 
 logger   = logging.getLogger(__name__)
 router   = APIRouter()
@@ -313,3 +314,30 @@ async def reset_thresholds():
     defaults = {"hsrp": 0.50, "helmet": 0.40, "ocr_confidence": 0.60}
     save_threshold_state(defaults)
     return {"status": "reset", "thresholds": defaults}
+
+
+# ── Live streaming ─────────────────────────────────────────────────────────────
+
+@router.websocket("/stream")
+async def phone_stream(websocket: WebSocket):
+    """Phone sender — receives JPEG bytes, returns annotated JPEG + JSON."""
+    await handle_phone_stream(websocket)
+
+
+@router.websocket("/stream-view")
+async def viewer_stream(websocket: WebSocket):
+    """Dashboard viewer — receives broadcast of annotated frames."""
+    await handle_viewer_stream(websocket)
+
+
+@router.get("/capture")
+async def capture_page():
+    """Serve the phone capture page as HTML."""
+    import pathlib
+    html_path = pathlib.Path(__file__).parent.parent.parent / "static" / "capture.html"
+    try:
+        with open(html_path, "r") as f:
+            content = f.read()
+        return HTMLResponse(content=content)
+    except FileNotFoundError:
+        raise HTTPException(404, "capture.html not found in static/")
