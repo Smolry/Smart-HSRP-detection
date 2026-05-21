@@ -183,7 +183,7 @@ class FramePipeline:
             if _run_ocr and ocr_mode != "off":
                 raw_ocr = ocr_model.predict(crop)
                 if raw_ocr.get("text"):
-                    stable_ocr  = ocr_stabilizer.update(track_id, raw_ocr["text"], raw_ocr.get("confidence", 0.0))
+                    stable_ocr  = ocr_stabilizer.update(vehicle_id=track_id, text=raw_ocr["text"], confidence=raw_ocr.get("confidence", 0.0))
                     ocr_decision = self.ocr_manager.process(
                         track_id, stable_ocr["text"], stable_ocr["confidence"], frame_id,
                         is_valid_format=bool(stable_ocr.get("text")),

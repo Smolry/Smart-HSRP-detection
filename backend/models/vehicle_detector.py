@@ -15,7 +15,7 @@ class VehicleDetector:
 
     def __init__(self, model_path: str = settings.VEHICLE_MODEL_PATH):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.half   = self.device == "cuda"
+        self.half   = False
         self.conf   = float(settings.VEHICLE_CONF_THRESHOLD)
         self.model  = YOLO(model_path)
         if self.half:

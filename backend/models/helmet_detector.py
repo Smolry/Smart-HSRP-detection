@@ -12,7 +12,7 @@ from config.settings import settings
 class HelmetDetector:
     def __init__(self, model_path: str = settings.HELMET_MODEL_PATH):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.half   = self.device == "cuda"
+        self.half   = False
         self.model  = YOLO(model_path)
         if self.half:
             self.model.model.half()

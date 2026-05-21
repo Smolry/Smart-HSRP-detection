@@ -43,3 +43,15 @@ static/outputs/
 uploads/
 
 *.pem
+
+# Model weights
+weights/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Large files
+*.mp4
+*.avi
+*.zip
