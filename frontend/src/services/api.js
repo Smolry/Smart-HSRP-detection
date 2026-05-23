@@ -40,17 +40,33 @@ export async function uploadVideo(token, file, options = {}) {
   return resp.json();
 }
 
+// ── Process existing video (skips upload phase) ───────────────────────────────
+
+export async function processExistingVideo(token, jobId, options = {}) {
+  const form = new FormData();
+  form.append('frame_skip',              String(options.frameSkip            ?? 1));
+  form.append('save_output_video',       String(options.saveVideo            ?? true));
+  form.append('annotate_violations',     String(options.annotateViolations   ?? true));
+  form.append('annotate_no_violations',  String(options.annotateNoViolations ?? false));
+  form.append('ocr_mode',                options.ocrMode ?? 'on_violation');
+
+  const resp = await fetch(`${REST_BASE}/api/process-existing/${jobId}`, {
+    method:  'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body:    form,
+  });
+  if (!resp.ok) throw new Error(`Process existing failed: ${resp.status}`);
+  return resp.json();
+}
+
+// ── List available input videos ───────────────────────────────────────────────
+
+export async function listInputVideos(token) {
+  return apiFetch('/api/input-videos', {}, token);
+}
+
 // ── WebSocket job stream ──────────────────────────────────────────────────────
 
-/**
- * connectJobStream — opens a WebSocket to /api/ws/{jobId}.
- *
- * onUpdate(data)  — called on each 'running' progress message
- * onDone()        — called once when status === 'completed'; REST fetch happens in caller
- * onError(err)    — called on failure
- *
- * Returns a cancel() function.
- */
 export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
   const url = `${WS_BASE}/api/ws/${jobId}`;
   const ws  = new WebSocket(url);
@@ -76,7 +92,7 @@ export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
     if (status === 'completed') {
       done = true;
       ws.close(1000);
-      onDone();   // caller does REST fetches
+      onDone();
       return;
     }
 
@@ -97,7 +113,6 @@ export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
 
   ws.onclose = (event) => {
     if (done) return;
-    // 1000 = normal close, 1005 = no status (also normal)
     if (event.code !== 1000 && event.code !== 1005) {
       onError(new Error(`WebSocket closed unexpectedly (code ${event.code})`));
     }
@@ -114,10 +129,6 @@ export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
 
 // ── Job result / tracks ───────────────────────────────────────────────────────
 
-/**
- * Retry up to `retries` times with `delay` ms between attempts.
- * Needed because Redis write and REST read can race right after WS completion.
- */
 async function fetchWithRetry(fn, retries = 5, delay = 800) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -137,7 +148,6 @@ export async function getJobTracks(token, jobId) {
   return fetchWithRetry(() => apiFetch(`/api/job-tracks/${jobId}`, {}, token));
 }
 
-// Returns the URL to stream/download the annotated video directly
 export function getVideoUrl(jobId) {
   return `${REST_BASE}/api/job-video/${jobId}`;
 }

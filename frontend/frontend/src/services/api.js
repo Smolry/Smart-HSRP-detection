@@ -1,7 +1,11 @@
+/**
+ * api.js — unified API service
+ */
+
 const REST_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 const WS_BASE   = REST_BASE.replace(/^http/, 'ws');
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 async function apiFetch(path, opts = {}, token = null) {
   const headers = {
@@ -36,130 +40,90 @@ export async function uploadVideo(token, file, options = {}) {
   return resp.json();
 }
 
-// ── Job stream — WS for progress, REST polling as fallback ───────────────────
-//
-// Strategy:
-//   1. Open WS to get live frame progress updates
-//   2. Simultaneously poll REST /job-result every 3s
-//   3. Whichever signals completion first wins — the other is cancelled
-//   4. If WS drops (1006 etc) polling takes over seamlessly
-//
-// This means 1006 is completely harmless — polling catches the completion.
+// ── Process existing video (skips upload phase) ───────────────────────────────
+
+export async function processExistingVideo(token, jobId, options = {}) {
+  const form = new FormData();
+  form.append('frame_skip',              String(options.frameSkip            ?? 1));
+  form.append('save_output_video',       String(options.saveVideo            ?? true));
+  form.append('annotate_violations',     String(options.annotateViolations   ?? true));
+  form.append('annotate_no_violations',  String(options.annotateNoViolations ?? false));
+  form.append('ocr_mode',                options.ocrMode ?? 'on_violation');
+
+  const resp = await fetch(`${REST_BASE}/api/process-existing/${jobId}`, {
+    method:  'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body:    form,
+  });
+  if (!resp.ok) throw new Error(`Process existing failed: ${resp.status}`);
+  return resp.json();
+}
+
+// ── List available input videos ───────────────────────────────────────────────
+
+export async function listInputVideos(token) {
+  return apiFetch('/api/input-videos', {}, token);
+}
+
+// ── WebSocket job stream ──────────────────────────────────────────────────────
 
 export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
-  let done      = false;
-  let ws        = null;
-  let pollTimer = null;
+  const url = `${WS_BASE}/api/ws/${jobId}`;
+  const ws  = new WebSocket(url);
 
-  function finish() {
+  let done = false;
+
+  ws.onopen = () => console.log('[WS] connected:', url);
+
+  ws.onmessage = (event) => {
     if (done) return;
-    done = true;
-    clearTimeout(pollTimer);
-    if (ws) {
-      ws.onmessage = null;
-      ws.onerror   = null;
-      ws.onclose   = null;
-      try { ws.close(); } catch {}
+    let data;
+    try { data = JSON.parse(event.data); } catch { return; }
+
+    const status = data.status;
+
+    if (status === 'failed') {
+      done = true;
+      onError(new Error(data.error || 'Job failed'));
+      ws.close(1000);
+      return;
     }
-    onDone();
-  }
 
-  function fail(err) {
-    if (done) return;
-    done = true;
-    clearTimeout(pollTimer);
-    if (ws) {
-      ws.onmessage = null;
-      ws.onerror   = null;
-      ws.onclose   = null;
-      try { ws.close(); } catch {}
+    if (status === 'completed') {
+      done = true;
+      ws.close(1000);
+      onDone();
+      return;
     }
-    onError(err);
-  }
 
-  // ── REST polling ────────────────────────────────────────────────────────────
-  // Runs independently of WS — if WS dies, this still catches completion.
-  async function poll() {
-    if (done) return;
-    try {
-      const resp = await fetch(`${REST_BASE}/api/job-result/${jobId}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+    if (status === 'running') {
+      onUpdate({
+        progress:     data.progress     ?? 0,
+        total_frames: data.total        ?? 0,
+        fps:          data.fps          ?? 0,
       });
-      console.log(`[poll] status=${resp.status} done=${done}`);
-      if (resp.ok) {
-        finish();
-        return;
-      }
-      if (resp.status === 500) {
-        const body = await resp.json().catch(() => ({}));
-        fail(new Error(body?.detail?.error || 'Job failed'));
-        return;
-      }
-      // 400 = not completed yet, 404 = not found — keep polling
-    } catch (e) {
-      console.warn('[poll] fetch error:', e);
     }
-    if (!done) {
-      pollTimer = setTimeout(poll, 3000);
+  };
+
+  ws.onerror = (e) => {
+    if (done) return;
+    console.error('[WS] error', e);
+    onError(new Error('WebSocket connection error'));
+  };
+
+  ws.onclose = (event) => {
+    if (done) return;
+    if (event.code !== 1000 && event.code !== 1005) {
+      onError(new Error(`WebSocket closed unexpectedly (code ${event.code})`));
     }
-  }
+  };
 
-  // Start polling after a short delay (give pipeline time to start)
-  pollTimer = setTimeout(poll, 4000);
-
-  // ── WebSocket — live progress only ──────────────────────────────────────────
-  try {
-    ws = new WebSocket(`${WS_BASE}/api/ws/${jobId}`);
-
-    ws.onmessage = (event) => {
-      if (done) return;
-      let data;
-      try { data = JSON.parse(event.data); } catch { return; }
-
-      if (data.status === 'failed') {
-        fail(new Error(data.error || 'Job failed'));
-        return;
-      }
-      if (data.status === 'completed') {
-        finish();
-        return;
-      }
-      if (data.status === 'running') {
-        onUpdate({
-          progress:     data.progress     ?? 0,
-          total_frames: data.total        ?? 0,
-          fps:          data.fps          ?? 0,
-        });
-      }
-    };
-
-    ws.onerror = () => {
-      // WS error — polling will handle completion, no need to do anything
-      console.warn('[WS] error — falling back to polling');
-    };
-
-    ws.onclose = (e) => {
-      // Any WS close (including 1006) is fine — polling takes over
-      if (e.code !== 1000) {
-        console.warn(`[WS] closed with code ${e.code} — polling active`);
-      }
-    };
-
-  } catch {
-    // WebSocket not available — polling only
-    console.warn('[WS] could not open — polling only');
-  }
-
-  // Return cancel function
   return () => {
     done = true;
-    clearTimeout(pollTimer);
-    if (ws) {
-      ws.onmessage = null;
-      ws.onerror   = null;
-      ws.onclose   = null;
-      try { ws.close(); } catch {}
-    }
+    ws.onmessage = null;
+    ws.onerror   = null;
+    ws.onclose   = null;
+    ws.close();
   };
 }
 
@@ -167,7 +131,9 @@ export function connectJobStream(token, jobId, onUpdate, onDone, onError) {
 
 async function fetchWithRetry(fn, retries = 5, delay = 800) {
   for (let i = 0; i < retries; i++) {
-    try { return await fn(); } catch (err) {
+    try {
+      return await fn();
+    } catch (err) {
       if (i === retries - 1) throw err;
       await new Promise(r => setTimeout(r, delay));
     }

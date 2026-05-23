@@ -31,6 +31,9 @@ from backend.utils.local_storage import (
     output_video_exists, cleanup_input,
 )
 
+from backend.utils.local_storage import INPUTS_DIR, OUTPUTS_DIR
+import re as _re
+
 logger   = logging.getLogger(__name__)
 router   = APIRouter()
 executor = ThreadPoolExecutor(max_workers=2)
@@ -313,3 +316,75 @@ async def reset_thresholds():
     defaults = {"hsrp": 0.50, "helmet": 0.40, "ocr_confidence": 0.60}
     save_threshold_state(defaults)
     return {"status": "reset", "thresholds": defaults}
+
+"""
+ROUTES ADDITIONS — append these to backend/api/routes.py
+=========================================================
+Add these two endpoints after the existing /job-video/{job_id} endpoint.
+They enable the "Available Videos" library feature on the frontend.
+"""
+
+# ── Available input videos library ───────────────────────────────────────────
+
+
+@router.get("/input-videos")
+async def list_input_videos():
+    """
+    List all video files in static/inputs/ so the frontend can show
+    a library of already-uploaded videos that can be re-processed
+    without uploading again.
+    """
+    videos = []
+    if INPUTS_DIR.exists():
+        for f in sorted(INPUTS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if f.suffix.lower() in (".mp4", ".avi", ".mov", ".mkv"):
+                job_id = f.stem
+                stat   = f.stat()
+                videos.append({
+                    "job_id":        job_id,
+                    "filename":      f.name,
+                    "size_mb":       round(stat.st_size / 1024 / 1024, 2),
+                    "uploaded_at":   stat.st_mtime,
+                    "has_output":    output_video_exists(job_id),
+                })
+    return {"videos": videos, "count": len(videos)}
+
+
+@router.post("/process-existing/{job_id}")
+async def process_existing_video(
+    job_id:                str,
+    frame_skip:            int  = Form(1),
+    save_output_video:     bool = Form(True),
+    annotate_violations:   bool = Form(True),
+    annotate_no_violations: bool = Form(False),
+    ocr_mode:              str  = Form("on_violation"),
+):
+    """
+    Kick off processing for a video already on disk in static/inputs/{job_id}.mp4.
+    Returns the same shape as /process-video so the frontend can reuse
+    its existing WebSocket + result-fetch flow without any changes.
+    """
+    input_path = INPUTS_DIR / f"{job_id}.mp4"
+    if not input_path.exists():
+        raise HTTPException(404, f"Input video {job_id}.mp4 not found on disk")
+
+    new_job_id   = str(uuid4())
+    output_path  = get_output_video_path(new_job_id)
+
+    await job_set(new_job_id, {"status": "queued", "progress": 0})
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(
+        executor,
+        run_pipeline_sync,
+        new_job_id,
+        str(input_path),
+        output_path,
+        frame_skip,
+        annotate_violations,
+        annotate_no_violations,
+        ocr_mode,
+    )
+
+    return {"job_id": new_job_id, "source_job_id": job_id, "status": "queued"}
+
