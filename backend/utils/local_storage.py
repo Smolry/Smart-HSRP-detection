@@ -3,6 +3,10 @@ LOCAL STORAGE UTILITY
 ======================
 All paths anchored to project root via __file__ — works regardless
 of which directory uvicorn is launched from.
+
+FIX: cleanup_input() is now a no-op so input videos are NEVER deleted
+after processing. They remain in static/inputs/ and are listed by the
+Available Videos library on the frontend.
 """
 import os
 import shutil
@@ -40,7 +44,14 @@ def get_video_url(job_id: str, base_url: str = "") -> str:
     return f"{base_url}/static/outputs/{job_id}.mp4"
 
 
+def get_input_video_url(job_id: str, base_url: str = "") -> str:
+    return f"{base_url}/static/inputs/{job_id}.mp4"
+
+
 def cleanup_input(job_id: str):
-    path = INPUTS_DIR / f"{job_id}.mp4"
-    if path.exists():
-        path.unlink()
+    """
+    Intentionally disabled — input videos are kept in static/inputs/
+    so they can be re-processed from the Available Videos library
+    without re-uploading.
+    """
+    pass  # DO NOT DELETE — kept for Available Videos library

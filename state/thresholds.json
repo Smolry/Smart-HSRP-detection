@@ -1,11 +1,11 @@
 {
-  "saved_at": 1778221552.3711684,
+  "saved_at": 1782814439.6429925,
   "states": {
     "hsrp": {
-      "current_threshold": 0.5003312006799139,
+      "current_threshold": NaN,
       "base_threshold": 0.5,
-      "estimated_quality": 0.9522741395393944,
-      "total_samples": 4029,
+      "estimated_quality": NaN,
+      "total_samples": 6253,
       "true_positives": 0,
       "false_positives": 0,
       "true_negatives": 0,
@@ -26,7 +26,13 @@
         0.5002986021885856,
         0.5002604642587503,
         0.500300396788572,
-        0.5003312006799139
+        0.5003312006799139,
+        0.5003132622239869,
+        0.5003145056899106,
+        0.5004385309127088,
+        NaN,
+        NaN,
+        NaN
       ]
     }
   }

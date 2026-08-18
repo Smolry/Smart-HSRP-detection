@@ -151,10 +151,7 @@ def run_pipeline_sync(job_id, tmp_path, output_video_path,
                 os.remove(tmp_path)
         except Exception:
             pass
-        try:
-            cleanup_input(job_id)
-        except Exception:
-            pass
+        # NOTE: cleanup_input() intentionally removed — inputs are kept in static/inputs/ for the library.
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────
@@ -376,7 +373,7 @@ async def process_existing_video(
     loop = asyncio.get_event_loop()
     loop.run_in_executor(
         executor,
-        run_pipeline_sync,
+        run_pipeline_existing,
         new_job_id,
         str(input_path),
         output_path,
@@ -388,3 +385,71 @@ async def process_existing_video(
 
     return {"job_id": new_job_id, "source_job_id": job_id, "status": "queued"}
 
+
+# ── Pipeline runner for already-stored input videos ───────────────────────────
+# Differs from run_pipeline_sync: does NOT call save_input_video (no copy needed)
+# and does NOT delete tmp_path in finally (the file must stay in static/inputs/).
+
+def run_pipeline_existing(job_id, video_path, output_video_path,
+                          frame_skip, annotate_violations, annotate_no_violations, ocr_mode):
+    import redis as sync_redis
+    import traceback
+
+    r = sync_redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", 6379)),
+        decode_responses=True,
+    )
+    channel    = f"job_progress:{job_id}"
+    start_time = time.time()
+
+    def publish(data):
+        r.hset(f"job:{job_id}", mapping={
+            k: json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+            for k, v in data.items()
+        })
+        r.publish(channel, json.dumps(data))
+
+    try:
+        logger.info(f"[{job_id}] Processing existing input: {video_path}")
+        publish({"status": "running", "progress": 0, "total": 0, "fps": 0})
+
+        def progress_cb(frames, total):
+            elapsed = time.time() - start_time
+            publish({
+                "status":   "running",
+                "progress": frames,
+                "total":    total,
+                "fps":      round(frames / elapsed if elapsed > 0 else 0, 2),
+            })
+
+        output = process_video(
+            video_path=video_path,
+            output_video_path=output_video_path,
+            frame_skip=frame_skip,
+            annotate_violations=annotate_violations,
+            annotate_no_violations=annotate_no_violations,
+            ocr_mode=ocr_mode,
+            progress_callback=progress_cb,
+            job_id=job_id,
+        )
+
+        if output.get("violations"):
+            store_violations_batch(output["violations"])
+
+        summary   = generate_violation_summary(output)
+        video_url = output.get("video_url") or get_video_url(job_id)
+
+        logger.info(f"[{job_id}] Complete | video_url={video_url}")
+        publish({
+            "status":          "completed",
+            "summary":         summary,
+            "metadata":        output.get("metadata", {}),
+            "track_summaries": output.get("track_summaries", {}),
+            "video_url":       video_url,
+        })
+
+    except Exception as e:
+        logger.error(f"[{job_id}] Error: {e}")
+        publish({"status": "failed", "error": str(e), "trace": traceback.format_exc()})
+    # No finally delete — static/inputs/ files are permanent.

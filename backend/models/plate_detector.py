@@ -1,79 +1,86 @@
 """
-TENSORRT-OPTIMIZED PLATE DETECTOR
-=====================================
-Uses TensorRT engine (.engine) if available, falls back to YOLO PyTorch.
-Engine is auto-exported on first run and cached at weights/plate_detector.engine
-
-Export once manually:
-    yolo export model=weights/plate_detector.pt format=engine device=0 batch=8 imgsz=768
+GPU-OPTIMIZED PLATE DETECTOR
+==============================
+YOLOv10s — supports both PyTorch (.pt) and TensorRT (.engine) backends.
+Same TRT batch-size handling as VehicleDetector.
 """
-import os
+
+import numpy as np
 import torch
-from pathlib import Path
 from ultralytics import YOLO
 from config.settings import settings
-
-
-def _trt_engine_path(pt_path: str) -> str:
-    return str(Path(pt_path).with_suffix(".engine"))
-
-
-def _export_to_trt(pt_path: str, batch: int = 8) -> str:
-    engine_path = _trt_engine_path(pt_path)
-    print(f"[PlateDetector] Exporting TensorRT engine → {engine_path} (batch={batch})")
-    m = YOLO(pt_path)
-    # imgsz=768 to keep small-plate accuracy
-    m.export(format="engine", device=0, batch=batch, imgsz=768, half=True, simplify=True)
-    return engine_path
 
 
 class PlateDetector:
     def __init__(self, model_path: str = settings.PLATE_MODEL_PATH):
         self.device    = "cuda" if torch.cuda.is_available() else "cpu"
-        self.using_trt = False
+        self.model     = YOLO(model_path)
+        self.is_trt    = str(model_path).endswith(".engine")
+        self.trt_batch = self._probe_trt_batch() if self.is_trt else 1
+        self.half      = self.is_trt
 
-        if self.device == "cuda":
-            engine_path = _trt_engine_path(model_path)
-            if not os.path.exists(engine_path):
-                try:
-                    engine_path = _export_to_trt(model_path)
-                except Exception as e:
-                    print(f"[PlateDetector] TRT export failed ({e}), falling back to PyTorch")
-                    engine_path = None
-
-            if engine_path and os.path.exists(engine_path):
-                self.model = YOLO(engine_path)
-                self.using_trt = True
-                print(f"[PlateDetector] TensorRT engine loaded | imgsz=768 | FP16")
-            else:
-                self.model = YOLO(model_path)
-                print(f"[PlateDetector] PyTorch fallback | cuda")
-        else:
-            self.model = YOLO(model_path)
-            print(f"[PlateDetector] CPU mode (no TRT)")
-
-    def predict(self, image) -> list:
-        results = self.model(
-            image, conf=0.4, imgsz=768, half=self.using_trt,
-            verbose=False, device=self.device,
+        print(
+            f"[PlateDetector] {self.device} | TRT={self.is_trt} "
+            f"| trt_batch={self.trt_batch} | FP16={self.half}"
         )
-        boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            return []
-        return [list(map(int, box.xyxy[0].cpu().numpy())) for box in boxes]
 
-    def predict_batch(self, images: list) -> list:
-        """Batch plate detection — returns list of bbox lists per image."""
-        if not images:
-            return []
-        results = self.model(
-            images, conf=0.4, imgsz=768, half=self.using_trt,
-            verbose=False, device=self.device, stream=False,
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def predict(self, image: np.ndarray) -> list:
+        """Single-frame inference. Returns list of [x1,y1,x2,y2] boxes."""
+        if self.is_trt and self.trt_batch > 1:
+            return self.predict_batch([image] * self.trt_batch)[0]
+        return self._run_predict([image])[0]
+
+    def predict_batch(self, frames: list) -> list:
+        """
+        Multi-frame inference. Returns list (one entry per frame) of box lists.
+        For TRT engines input length must equal trt_batch; we pad/trim if needed.
+        """
+        if self.is_trt:
+            frames = self._pad_to_trt_batch(frames)
+        return self._run_predict(frames)
+
+    # ── Internals ─────────────────────────────────────────────────────────
+
+    def _run_predict(self, frames: list) -> list:
+        results = self.model.predict(
+            source=frames,
+            conf=0.4,
+            imgsz=768,
+            half=self.half,
+            verbose=False,
+            device=self.device,
         )
-        out = []
+        per_frame = []
         for r in results:
-            if r.boxes is None or len(r.boxes) == 0:
-                out.append([])
+            boxes = r.boxes
+            if boxes is None or len(boxes) == 0:
+                per_frame.append([])
             else:
-                out.append([list(map(int, box.xyxy[0].cpu().numpy())) for box in r.boxes])
-        return out
+                per_frame.append([
+                    list(map(int, box.xyxy[0].cpu().numpy()))
+                    for box in boxes
+                ])
+        return per_frame
+
+    def _pad_to_trt_batch(self, frames: list) -> list:
+        n = self.trt_batch
+        if len(frames) == n:
+            return frames
+        if len(frames) > n:
+            return frames[:n]
+        last = frames[-1] if frames else np.zeros((768, 768, 3), dtype=np.uint8)
+        return frames + [last] * (n - len(frames))
+
+    def _probe_trt_batch(self) -> int:
+        try:
+            backend = self.model.model
+            if hasattr(backend, "batch"):
+                return int(backend.batch)
+            if hasattr(backend, "engine"):
+                shape = backend.engine.get_profile_shape(0, 0)
+                return int(shape[2][0])
+        except Exception as e:
+            print(f"[PlateDetector] TRT batch probe failed ({e}), assuming 8")
+        return 8

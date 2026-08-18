@@ -1,96 +1,129 @@
 """
-TENSORRT-OPTIMIZED VEHICLE DETECTOR
-=====================================
-Uses TensorRT engine (.engine) if available, falls back to YOLO PyTorch.
-Engine is auto-exported on first run and cached at weights/vehicle-person.engine
+GPU-OPTIMIZED VEHICLE DETECTOR
+================================
+YOLOv11m — supports both PyTorch (.pt) and TensorRT (.engine) backends.
 
-Export once manually (or let it auto-export on startup):
-    yolo export model=weights/vehicle-person.pt format=engine device=0 batch=8 imgsz=640
+TensorRT engines exported with a fixed max_batch_size (e.g. 8) CANNOT
+accept batch=1 during Ultralytics warmup — the engine hard-asserts the
+input shape matches max_batch_size.  We detect this at load time and
+expose two paths:
+
+  self.is_trt      — True when a .engine file is loaded
+  self.trt_batch   — The max_batch_size the engine was compiled with
+  self.detect()    — Single-frame inference (always works, pads for TRT)
+  self.detect_batch() — Multi-frame inference; for TRT always sends
+                        exactly trt_batch frames (padding the tail)
+
+video_pipeline uses detect_batch() so YOLO runs once per N frames
+instead of once per frame.
 """
-import os
+
+import numpy as np
 import torch
-from pathlib import Path
 from ultralytics import YOLO
 from config.settings import settings
-
-
-def _trt_engine_path(pt_path: str) -> str:
-    return str(Path(pt_path).with_suffix(".engine"))
-
-
-def _export_to_trt(pt_path: str, batch: int = 8) -> str:
-    engine_path = _trt_engine_path(pt_path)
-    print(f"[VehicleDetector] Exporting TensorRT engine → {engine_path} (batch={batch})")
-    m = YOLO(pt_path)
-    m.export(format="engine", device=0, batch=batch, imgsz=640, half=True, simplify=True)
-    return engine_path
 
 
 class VehicleDetector:
     VEHICLE_CLASSES = {"car", "motorcycle", "bus", "truck"}
     PERSON_CLASS    = "person"
-    COCO_IDS        = [0, 2, 3, 5, 7]  # person, car, motorcycle, bus, truck
+    COCO_IDS        = [0, 2, 3, 5, 7]   # person, car, motorcycle, bus, truck
 
     def __init__(self, model_path: str = settings.VEHICLE_MODEL_PATH):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.conf   = float(settings.VEHICLE_CONF_THRESHOLD)
-        self.using_trt = False
+        self.device    = "cuda" if torch.cuda.is_available() else "cpu"
+        self.conf      = float(settings.VEHICLE_CONF_THRESHOLD)
+        self.model     = YOLO(model_path)
+        self.is_trt    = str(model_path).endswith(".engine")
+        self.trt_batch = self._probe_trt_batch() if self.is_trt else 1
+        self.half      = self.is_trt   # TRT engines are already quantised
 
-        if self.device == "cuda":
-            engine_path = _trt_engine_path(model_path)
-            if not os.path.exists(engine_path):
-                try:
-                    engine_path = _export_to_trt(model_path)
-                except Exception as e:
-                    print(f"[VehicleDetector] TRT export failed ({e}), falling back to PyTorch")
-                    engine_path = None
-
-            if engine_path and os.path.exists(engine_path):
-                self.model = YOLO(engine_path)
-                self.using_trt = True
-                print(f"[VehicleDetector] TensorRT engine loaded | batch=8 | FP16")
-            else:
-                self.model = YOLO(model_path)
-                print(f"[VehicleDetector] PyTorch fallback | cuda | FP32")
-        else:
-            self.model = YOLO(model_path)
-            print(f"[VehicleDetector] CPU mode (no TRT)")
-
-    def detect(self, frame):
-        """Single-frame detection. For batch use detect_batch()."""
-        results = self.model.predict(
-            source=frame, conf=self.conf, device=self.device,
-            classes=self.COCO_IDS, imgsz=640, half=self.using_trt, verbose=False,
+        print(
+            f"[VehicleDetector] {self.device} | TRT={self.is_trt} "
+            f"| trt_batch={self.trt_batch} | FP16={self.half}"
         )
-        return self._parse(results)
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def detect(self, frame: np.ndarray) -> list:
+        """Single-frame inference. Always returns a list of detection dicts."""
+        if self.is_trt and self.trt_batch > 1:
+            # TRT engine needs exactly trt_batch frames — pad with the same frame
+            return self.detect_batch([frame] * self.trt_batch)[0]
+        return self._run_predict([frame])[0]
 
     def detect_batch(self, frames: list) -> list:
-        """Batch inference — significantly faster with TRT engine."""
-        if not frames:
-            return []
+        """
+        Multi-frame inference.  Returns a list (one entry per input frame)
+        of detection lists.
+
+        For TRT engines the input length MUST equal trt_batch exactly.
+        video_pipeline guarantees this via tail-padding in video_reader.
+        If called with a different length anyway, we pad/trim to be safe.
+        """
+        if self.is_trt:
+            frames = self._pad_to_trt_batch(frames)
+        return self._run_predict(frames)
+
+    # ── Internals ─────────────────────────────────────────────────────────
+
+    def _run_predict(self, frames: list) -> list:
+        """Run model.predict on a list of frames, return per-frame det lists."""
         results = self.model.predict(
-            source=frames, conf=self.conf, device=self.device,
-            classes=self.COCO_IDS, imgsz=640, half=self.using_trt, verbose=False,
-            stream=False,
+            source=frames,
+            conf=self.conf,
+            device=self.device,
+            classes=self.COCO_IDS,
+            imgsz=640,
+            half=self.half,
+            verbose=False,
         )
-        return [self._parse_single(r) for r in results]
-
-    def _parse(self, results):
-        out = []
+        per_frame = []
         for r in results:
-            out.extend(self._parse_single(r))
-        return out
+            dets = []
+            if r.boxes is not None:
+                for box in r.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy.squeeze().cpu().numpy())
+                    cls_id = int(box.cls.item())
+                    dets.append({
+                        "bbox":       [x1, y1, x2, y2],
+                        "confidence": float(box.conf.item()),
+                        "class":      self.model.names[cls_id],
+                    })
+            per_frame.append(dets)
+        return per_frame
 
-    def _parse_single(self, r):
-        out = []
-        if r.boxes is None:
-            return out
-        for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy.squeeze().cpu().numpy())
-            cls_id = int(box.cls.item())
-            out.append({
-                "bbox":       [x1, y1, x2, y2],
-                "confidence": float(box.conf.item()),
-                "class":      self.model.names[cls_id],
-            })
-        return out
+    def _pad_to_trt_batch(self, frames: list) -> list:
+        """Pad (or trim) frame list to exactly trt_batch using last frame repeat."""
+        n = self.trt_batch
+        if len(frames) == n:
+            return frames
+        if len(frames) > n:
+            return frames[:n]
+        # pad
+        last = frames[-1] if frames else np.zeros((640, 640, 3), dtype=np.uint8)
+        return frames + [last] * (n - len(frames))
+
+    def _probe_trt_batch(self) -> int:
+        """
+        Read the max batch size from the loaded TRT engine without running
+        a forward pass (which would crash at the wrong batch size).
+        Falls back to 8 if introspection fails.
+        """
+        try:
+            # Ultralytics wraps TRT in autobackend; the engine is at .predictor
+            # or directly accessible via the underlying backend after the model
+            # is loaded.  Safest path: read from the compiled engine binding.
+            backend = self.model.model   # nn.Module or TRT backend wrapper
+            # Ultralytics TRT backend stores max_batch as an attribute
+            if hasattr(backend, "batch"):
+                return int(backend.batch)
+            # Fallback: peek at the engine directly
+            if hasattr(backend, "engine"):
+                profile_idx = 0
+                binding_idx = 0  # first input binding
+                shape = backend.engine.get_profile_shape(profile_idx, binding_idx)
+                # shape is (min, opt, max) — we want max[0]
+                return int(shape[2][0])
+        except Exception as e:
+            print(f"[VehicleDetector] TRT batch probe failed ({e}), assuming 8")
+        return 8

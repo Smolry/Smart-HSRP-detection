@@ -1,18 +1,3 @@
-"""
-TENSORRT-OPTIMIZED HSRP CLASSIFIER
-=====================================
-EfficientNet-B0 TorchScript → TensorRT via torch2trt.
-Falls back to original TorchScript on CPU or if torch2trt is not installed.
-
-Export once manually:
-    python -c "
-    from backend.models.hsrp_classifier import HSRPClassifier
-    c = HSRPClassifier()
-    c.export_trt()
-    "
-
-Requires: pip install torch2trt
-"""
 import os
 import torch
 import cv2
@@ -21,13 +6,7 @@ from pathlib import Path
 from config.settings import settings
 
 
-def _trt_path(pt_path: str) -> str:
-    return str(Path(pt_path).with_stem(Path(pt_path).stem + "_trt").with_suffix(".pth"))
-
-
 class HSRPClassifier:
-    """sigmoid(logit) → P(non_hsrp). 0=HSRP, 1=Non-HSRP."""
-
     _MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     _STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
@@ -35,82 +14,53 @@ class HSRPClassifier:
         self.device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.threshold = float(settings.HSRP_CONF_THRESHOLD)
         self.using_trt = False
-        dtype          = torch.float16 if self.device.type == "cuda" else torch.float32
+        self.trt_ctx   = None
+        self.model     = None
 
-        self.model = self._load(model_path)
+        engine_path = str(Path(model_path).with_suffix(".engine"))
 
+        if self.device.type == "cuda" and os.path.exists(engine_path):
+            try:
+                self._load_trt_engine(engine_path)
+                self.using_trt = True
+                print("[HSRPClassifier] TensorRT engine loaded | FP16")
+            except Exception as e:
+                print(f"[HSRPClassifier] TRT load failed ({e}), falling back to TorchScript")
+                self._load_torchscript(model_path)
+        else:
+            self._load_torchscript(model_path)
+
+        dtype = torch.float16 if self.device.type == "cuda" else torch.float32
         self._mean = self._MEAN.to(self.device, dtype=dtype)
         self._std  = self._STD.to(self.device, dtype=dtype)
         print(f"[HSRPClassifier] {self.device} | TRT={self.using_trt}")
 
-    def _load(self, path: str):
-        """Try TRT first, then TorchScript."""
-        trt_path = _trt_path(path)
+    def _load_trt_engine(self, engine_path: str):
+        import tensorrt as trt
+        import pycuda.driver as cuda
+        import pycuda.autoinit  # noqa
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+        with open(engine_path, "rb") as f:
+            self.trt_engine = runtime.deserialize_cuda_engine(f.read())
+        self.trt_ctx = self.trt_engine.create_execution_context()
+        self._cuda = cuda
+        self._input_shape  = (1, 3, 224, 224)
+        self._output_shape = (1, 1)
+        self._d_input  = cuda.mem_alloc(int(np.prod(self._input_shape))  * 2)
+        self._d_output = cuda.mem_alloc(int(np.prod(self._output_shape)) * 2)
+        self._stream   = cuda.Stream()
 
-        # Try loading pre-exported TRT model
-        if self.device.type == "cuda" and os.path.exists(trt_path):
-            try:
-                from torch2trt import TRTModule
-                m = TRTModule()
-                m.load_state_dict(torch.load(trt_path))
-                m.eval()
-                self.using_trt = True
-                print(f"[HSRPClassifier] TRT module loaded from {trt_path}")
-                return m
-            except Exception as e:
-                print(f"[HSRPClassifier] TRT load failed ({e}), trying auto-export...")
-
-        # Try auto-exporting to TRT
-        if self.device.type == "cuda" and os.path.exists(path):
-            try:
-                base_model = self._load_torchscript(path)
-                if base_model is not None:
-                    trt_model = self._export_trt(base_model, trt_path)
-                    if trt_model is not None:
-                        return trt_model
-            except Exception as e:
-                print(f"[HSRPClassifier] TRT auto-export failed ({e})")
-
-        # Fallback to TorchScript
-        return self._load_torchscript(path)
-
-    def _load_torchscript(self, path: str):
+    def _load_torchscript(self, model_path: str):
         try:
-            m = torch.jit.load(path, map_location=self.device)
-            m.eval()
+            self.model = torch.jit.load(model_path, map_location=self.device)
+            self.model.eval()
             if self.device.type == "cuda":
-                m = m.half()
-            return m
+                self.model = self.model.half()
+            print("[HSRPClassifier] TorchScript loaded")
         except Exception as e:
             print(f"[HSRPClassifier] TorchScript load failed: {e}")
-            return None
-
-    def _export_trt(self, base_model, trt_path: str):
-        """Export TorchScript model to TRT and save."""
-        try:
-            from torch2trt import torch2trt
-            print(f"[HSRPClassifier] Exporting TRT → {trt_path}")
-            dummy = torch.randn(1, 3, 224, 224).to(self.device).half()
-            trt_model = torch2trt(
-                base_model, [dummy],
-                fp16_mode=True,
-                max_batch_size=16,
-                use_onnx=True,
-            )
-            torch.save(trt_model.state_dict(), trt_path)
-            self.using_trt = True
-            print(f"[HSRPClassifier] TRT export complete")
-            return trt_model
-        except Exception as e:
-            print(f"[HSRPClassifier] torch2trt export failed: {e}")
-            return None
-
-    def export_trt(self):
-        """Public method to manually trigger TRT export."""
-        path = settings.HSRP_MODEL_PATH
-        base = self._load_torchscript(path)
-        if base:
-            self._export_trt(base, _trt_path(path))
+            self.model = None
 
     def preprocess(self, img: np.ndarray) -> torch.Tensor:
         img = cv2.resize(img, (224, 224))
@@ -121,42 +71,33 @@ class HSRPClassifier:
             t = t.half()
         return (t - self._mean) / self._std
 
-    def preprocess_batch(self, imgs: list) -> torch.Tensor:
-        tensors = []
-        for img in imgs:
-            img = cv2.resize(img, (224, 224))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            t   = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-            tensors.append(t)
-        batch = torch.stack(tensors).to(self.device)
-        if self.device.type == "cuda":
-            batch = batch.half()
-        return (batch - self._mean) / self._std
+    def _trt_infer(self, x: torch.Tensor) -> float:
+        arr = x.contiguous().cpu().numpy().astype(np.float16)
+        self._cuda.memcpy_htod_async(self._d_input, arr, self._stream)
+        # TensorRT 10.x API: set tensor addresses then execute
+        self.trt_ctx.set_tensor_address("input",  int(self._d_input))
+        self.trt_ctx.set_tensor_address("output", int(self._d_output))
+        self.trt_ctx.execute_async_v3(stream_handle=self._stream.handle)
+        out = np.empty(self._output_shape, dtype=np.float16)
+        self._cuda.memcpy_dtoh_async(out, self._d_output, self._stream)
+        self._stream.synchronize()
+        return float(1.0 / (1.0 + np.exp(-float(out[0, 0]))))
 
     def predict(self, plate_image: np.ndarray) -> dict:
-        if plate_image is None or plate_image.size == 0 or self.model is None:
+        if plate_image is None or plate_image.size == 0:
             return self._empty()
         x = self.preprocess(plate_image)
-        with torch.no_grad():
-            prob_non_hsrp = torch.sigmoid(self.model(x).squeeze()).float().item()
+        if self.using_trt and self.trt_ctx:
+            prob_non_hsrp = self._trt_infer(x)
+        elif self.model is not None:
+            with torch.no_grad():
+                prob_non_hsrp = torch.sigmoid(self.model(x).squeeze()).float().item()
+        else:
+            return self._empty()
         return self._result(prob_non_hsrp)
 
     def predict_batch(self, plate_images: list) -> list:
-        """Batch HSRP classification."""
-        valid = [(i, img) for i, img in enumerate(plate_images)
-                 if img is not None and img.size > 0]
-        if not valid or self.model is None:
-            return [self._empty() for _ in plate_images]
-
-        indices, imgs = zip(*valid)
-        x = self.preprocess_batch(list(imgs))
-        with torch.no_grad():
-            probs = torch.sigmoid(self.model(x).squeeze(1)).float().tolist()
-        if isinstance(probs, float):
-            probs = [probs]
-
-        parsed = {idx: self._result(p) for idx, p in zip(indices, probs)}
-        return [parsed.get(i, self._empty()) for i in range(len(plate_images))]
+        return [self.predict(img) for img in plate_images]
 
     def _result(self, prob_non_hsrp: float) -> dict:
         prob_hsrp = 1.0 - prob_non_hsrp
@@ -165,10 +106,10 @@ class HSRPClassifier:
         else:
             label, conf = "hsrp", prob_hsrp
         return {
-            "label":         label,
-            "confidence":    round(conf, 4),
-            "prob_non_hsrp": round(prob_non_hsrp, 4),
-            "prob_hsrp":     round(prob_hsrp, 4),
+            "label":          label,
+            "confidence":     round(conf, 4),
+            "prob_non_hsrp":  round(prob_non_hsrp, 4),
+            "prob_hsrp":      round(prob_hsrp, 4),
         }
 
     def _empty(self):
