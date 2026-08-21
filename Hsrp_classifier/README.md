@@ -40,6 +40,16 @@ The original notebook reports the class mapping:
 hsrp      -> 0
 non-hsrp  -> 1
 ```
+The HSRP classification dataset was created and prepared specifically
+for this project.
+
+Dataset:
+
+The dataset is versioned and documented separately on Hugging Face.
+
+The HSRP classification model trained using this dataset is available
+at:
+[https://huggingface.co/Smolry/hsrp-classification_data](https://huggingface.co/datasets/Smolry/HSRP_classification_data)
 
 ## Preprocessing
 
