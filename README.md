@@ -370,6 +370,10 @@ Smart-HSRP integrates both project-developed components and third-party pretrain
 - The **Smart-HSRP application/pipeline** (7-layer processing pipeline, Temporal Decision Fusion, Adaptive Threshold Learner, Database Gate, Violation Prediction Engine, backend, and dashboard) and the **project-specific HSRP and helmet classification work** are contributions of this project.
 - The **vehicle/person detector (YOLO11)**, **object tracker (DeepSORT)**, **license-plate detector (YOLOv10s)**, and **OCR engine (EasyOCR)** are third-party pretrained models/libraries, used as pipeline components. Their original authors are credited in [§13](#13-attribution--citations).
 - Archival copies of project-developed models hosted on Hugging Face do **not** imply ownership of any third-party model or dataset referenced above.
+- ## Collaborators
+    | <a href="https://github.com/Guardian-22"><img alt="@Guardian-22" src="https://github.com/Guardian-22.png" width="80" /></a> | <a href="https://github.com/Smolry"><img alt="@Smolry" src="https://github.com/Smolry.png" width="80" /></a> | <a href="https://github.com/ketanb27"><img alt="@ketanb27" src="https://github.com/ketanb27.png" width="80" /></a> | <a href="https://github.com/Parth-54"><img alt="@Parth-54" src="https://github.com/Parth-54.png" width="80" /></a> |
+    |---|---|---|---|
+    | **@Guardian-22** | **@Smolry** | **@ketanb27** | **@Parth-54** |
 
 ---
 
