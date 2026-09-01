@@ -1,94 +1,116 @@
+import os
 import torch
 import cv2
 import numpy as np
+from pathlib import Path
 from config.settings import settings
 
 
 class HSRPClassifier:
-    """
-    EfficientNet-based binary classifier.
-    Output convention:
-        sigmoid(logit) → P(non_hsrp)
-        0 = HSRP
-        1 = Non-HSRP
-    """
+    _MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    _STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
     def __init__(self, model_path: str = settings.HSRP_MODEL_PATH):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.decision_threshold = float(settings.HSRP_CONF_THRESHOLD)
-        self.model = self._load_model(model_path)
+        self.device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.threshold = float(settings.HSRP_CONF_THRESHOLD)
+        self.using_trt = False
+        self.trt_ctx   = None
+        self.model     = None
 
-        if self.model:
-            print(f"HSRPClassifier loaded on {self.device}")
+        engine_path = str(Path(model_path).with_suffix(".engine"))
 
-    def _load_model(self, model_path):
+        if self.device.type == "cuda" and os.path.exists(engine_path):
+            try:
+                self._load_trt_engine(engine_path)
+                self.using_trt = True
+                print("[HSRPClassifier] TensorRT engine loaded | FP16")
+            except Exception as e:
+                print(f"[HSRPClassifier] TRT load failed ({e}), falling back to TorchScript")
+                self._load_torchscript(model_path)
+        else:
+            self._load_torchscript(model_path)
+
+        dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        self._mean = self._MEAN.to(self.device, dtype=dtype)
+        self._std  = self._STD.to(self.device, dtype=dtype)
+        print(f"[HSRPClassifier] {self.device} | TRT={self.using_trt}")
+
+    def _load_trt_engine(self, engine_path: str):
+        import tensorrt as trt
+        import pycuda.driver as cuda
+        import pycuda.autoinit  # noqa
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+        with open(engine_path, "rb") as f:
+            self.trt_engine = runtime.deserialize_cuda_engine(f.read())
+        self.trt_ctx = self.trt_engine.create_execution_context()
+        self._cuda = cuda
+        self._input_shape  = (1, 3, 224, 224)
+        self._output_shape = (1, 1)
+        self._d_input  = cuda.mem_alloc(int(np.prod(self._input_shape))  * 2)
+        self._d_output = cuda.mem_alloc(int(np.prod(self._output_shape)) * 2)
+        self._stream   = cuda.Stream()
+
+    def _load_torchscript(self, model_path: str):
         try:
-            model = torch.jit.load(model_path, map_location=self.device)
-            model.eval()
-            return model
+            self.model = torch.jit.load(model_path, map_location=self.device)
+            self.model.eval()
+            if self.device.type == "cuda":
+                self.model = self.model.half()
+            print("[HSRPClassifier] TorchScript loaded")
         except Exception as e:
-            print(f"[HSRPClassifier] Model load failed: {e}")
-            return None
+            print(f"[HSRPClassifier] TorchScript load failed: {e}")
+            self.model = None
 
-    # -------------------------------------------------
-    # Preprocessing (ImageNet-compatible)
-    # -------------------------------------------------
     def preprocess(self, img: np.ndarray) -> torch.Tensor:
         img = cv2.resize(img, (224, 224))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
+        t   = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        t   = t.to(self.device)
+        if self.device.type == "cuda":
+            t = t.half()
+        return (t - self._mean) / self._std
 
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        img = (img - mean) / std
+    def _trt_infer(self, x: torch.Tensor) -> float:
+        arr = x.contiguous().cpu().numpy().astype(np.float16)
+        self._cuda.memcpy_htod_async(self._d_input, arr, self._stream)
+        # TensorRT 10.x API: set tensor addresses then execute
+        self.trt_ctx.set_tensor_address("input",  int(self._d_input))
+        self.trt_ctx.set_tensor_address("output", int(self._d_output))
+        self.trt_ctx.execute_async_v3(stream_handle=self._stream.handle)
+        out = np.empty(self._output_shape, dtype=np.float16)
+        self._cuda.memcpy_dtoh_async(out, self._d_output, self._stream)
+        self._stream.synchronize()
+        return float(1.0 / (1.0 + np.exp(-float(out[0, 0]))))
 
-        img = np.transpose(img, (2, 0, 1))
-        img = torch.from_numpy(img).unsqueeze(0)
-
-        return img.to(self.device)
-
-    # -------------------------------------------------
-    # Prediction
-    # -------------------------------------------------
     def predict(self, plate_image: np.ndarray) -> dict:
         if plate_image is None or plate_image.size == 0:
-            return self._empty_result()
-
-        if self.model is None:
-            return self._empty_result()
-
-        input_tensor = self.preprocess(plate_image)
-
-        with torch.no_grad():
-            logit = self.model(input_tensor).squeeze()
-            prob_non_hsrp = torch.sigmoid(logit).item()
-
-        prob_hsrp = 1.0 - prob_non_hsrp
-
-        # Decision logic (clear + symmetric)
-        if prob_non_hsrp >= self.decision_threshold:
-            label = "non_hsrp"
-            confidence = prob_non_hsrp
+            return self._empty()
+        x = self.preprocess(plate_image)
+        if self.using_trt and self.trt_ctx:
+            prob_non_hsrp = self._trt_infer(x)
+        elif self.model is not None:
+            with torch.no_grad():
+                prob_non_hsrp = torch.sigmoid(self.model(x).squeeze()).float().item()
         else:
-            label = "hsrp"
-            confidence = prob_hsrp
+            return self._empty()
+        return self._result(prob_non_hsrp)
 
+    def predict_batch(self, plate_images: list) -> list:
+        return [self.predict(img) for img in plate_images]
+
+    def _result(self, prob_non_hsrp: float) -> dict:
+        prob_hsrp = 1.0 - prob_non_hsrp
+        if prob_non_hsrp >= self.threshold:
+            label, conf = "non_hsrp", prob_non_hsrp
+        else:
+            label, conf = "hsrp", prob_hsrp
         return {
-            "label": label,
-            "confidence": round(float(confidence), 4),
-            "prob_non_hsrp": round(float(prob_non_hsrp), 4),
-            "prob_hsrp": round(float(prob_hsrp), 4),
-            "device_used": str(self.device)
+            "label":          label,
+            "confidence":     round(conf, 4),
+            "prob_non_hsrp":  round(prob_non_hsrp, 4),
+            "prob_hsrp":      round(prob_hsrp, 4),
         }
 
-    # -------------------------------------------------
-    # Safe fallback
-    # -------------------------------------------------
-    def _empty_result(self):
-        return {
-            "label": None,
-            "confidence": 0.0,
-            "prob_non_hsrp": 0.0,
-            "prob_hsrp": 0.0,
-            "device_used": str(self.device)
-        }
+    def _empty(self):
+        return {"label": None, "confidence": 0.0, "prob_non_hsrp": 0.0, "prob_hsrp": 0.0}

@@ -1,12 +1,9 @@
 """
 API ROUTES
 ===========
-
-Local storage version — optimized for browser video playback.
-
-- Input  → static/inputs/<job_id>.mp4
-- Output → static/outputs/<job_id>.mp4
-- Served via → /api/job-video/<job_id>
+EC2 local storage — S3 removed entirely.
+Worker uses ThreadPoolExecutor (safe for GPU model imports).
+WebSocket uses async pubsub.listen() — no timeout polling issues on Windows.
 """
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form, WebSocket, WebSocketDisconnect, Query
@@ -25,28 +22,26 @@ import redis.asyncio as redis
 
 from backend.core.video_pipeline import process_video, generate_violation_summary
 from backend.services.storage import (
-    store_violations_batch,
-    get_violations,
-    save_threshold_state,
-    load_threshold_state,
+    store_violations_batch, get_violations,
+    save_threshold_state, load_threshold_state,
 )
 from backend.db.database import get_db
 from backend.utils.local_storage import (
-    save_input_video,
-    get_output_video_path,
-    get_video_url,
-    output_video_exists,
-    cleanup_input,
+    save_input_video, get_output_video_path, get_video_url,
+    output_video_exists, cleanup_input,
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from backend.utils.local_storage import INPUTS_DIR, OUTPUTS_DIR
+import re as _re
 
-router = APIRouter()
-redis_client: Optional[redis.Redis] = None
+logger   = logging.getLogger(__name__)
+router   = APIRouter()
 executor = ThreadPoolExecutor(max_workers=2)
 
-# ── Redis Setup ─────────────────────────────────
+redis_client: Optional[redis.Redis] = None
+
+
+# ── Redis ─────────────────────────────────────────────────────────────────────
 
 async def init_redis():
     global redis_client
@@ -57,17 +52,18 @@ async def init_redis():
     )
     logger.info("Redis connected")
 
+
 async def close_redis():
     if redis_client:
         await redis_client.close()
 
-# ── Redis Helpers ───────────────────────────────
 
 async def job_set(job_id: str, data: dict):
     await redis_client.hset(f"job:{job_id}", mapping={
         k: json.dumps(v) if isinstance(v, (dict, list)) else str(v)
         for k, v in data.items()
     })
+
 
 async def job_get(job_id: str):
     data = await redis_client.hgetall(f"job:{job_id}")
@@ -76,32 +72,25 @@ async def job_get(job_id: str):
     result = {}
     for k, v in data.items():
         try:
-            if v and (v.startswith("{") or v.startswith("[")):
-                result[k] = json.loads(v)
-            else:
-                result[k] = v
-        except:
+            result[k] = json.loads(v) if v and (v.startswith("{") or v.startswith("[")) else v
+        except Exception:
             result[k] = v
     return result
 
-# ── Worker ─────────────────────────────────────
+
+# ── Background worker ─────────────────────────────────────────────────────────
 
 def run_pipeline_sync(job_id, tmp_path, output_video_path,
-                      frame_skip, annotate_violations,
-                      annotate_no_violations, ocr_mode):
-
+                      frame_skip, annotate_violations, annotate_no_violations, ocr_mode):
     import redis as sync_redis
     import traceback
-
-    logger.info(f"[{job_id}] Worker started")
 
     r = sync_redis.Redis(
         host=os.getenv("REDIS_HOST", "localhost"),
         port=int(os.getenv("REDIS_PORT", 6379)),
         decode_responses=True,
     )
-
-    channel = f"job_progress:{job_id}"
+    channel    = f"job_progress:{job_id}"
     start_time = time.time()
 
     def publish(data):
@@ -113,15 +102,17 @@ def run_pipeline_sync(job_id, tmp_path, output_video_path,
 
     try:
         video_path = save_input_video(tmp_path, job_id)
+        logger.info(f"[{job_id}] Input saved: {video_path}")
+
+        publish({"status": "running", "progress": 0, "total": 0, "fps": 0})
 
         def progress_cb(frames, total):
             elapsed = time.time() - start_time
-            fps = frames / elapsed if elapsed > 0 else 0
             publish({
-                "status": "running",
+                "status":   "running",
                 "progress": frames,
-                "total": total,
-                "fps": round(fps, 2),
+                "total":    total,
+                "fps":      round(frames / elapsed if elapsed > 0 else 0, 2),
             })
 
         output = process_video(
@@ -138,136 +129,148 @@ def run_pipeline_sync(job_id, tmp_path, output_video_path,
         if output.get("violations"):
             store_violations_batch(output["violations"])
 
-        summary = generate_violation_summary(output)
+        summary   = generate_violation_summary(output)
         video_url = output.get("video_url") or get_video_url(job_id)
 
+        logger.info(f"[{job_id}] Complete | video_url={video_url}")
         publish({
-            "status": "completed",
-            "summary": summary,
-            "metadata": output.get("metadata", {}),
+            "status":          "completed",
+            "summary":         summary,
+            "metadata":        output.get("metadata", {}),
             "track_summaries": output.get("track_summaries", {}),
-            "video_url": video_url,
+            "video_url":       video_url,
         })
 
     except Exception as e:
         logger.error(f"[{job_id}] Error: {e}")
-        publish({
-            "status": "failed",
-            "error": str(e),
-            "trace": traceback.format_exc(),
-        })
+        publish({"status": "failed", "error": str(e), "trace": traceback.format_exc()})
 
     finally:
         try:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
-        except:
+        except Exception:
             pass
+        # NOTE: cleanup_input() intentionally removed — inputs are kept in static/inputs/ for the library.
 
-        try:
-            cleanup_input(job_id)
-        except:
-            pass
 
-# ── Upload ─────────────────────────────────────
+# ── Upload ────────────────────────────────────────────────────────────────────
 
 @router.post("/process-video")
 async def process_video_endpoint(
-    file: UploadFile = File(...),
-    frame_skip: int = Form(1),
-    save_output_video: bool = Form(True),
-    annotate_violations: bool = Form(True),
-    annotate_no_violations: bool = Form(False),
-    ocr_mode: str = Form("always"),
+    file:                  UploadFile = File(...),
+    frame_skip:            int  = Form(1),
+    save_output_video:     bool = Form(True),
+    annotate_violations:   bool = Form(True),
+    annotate_no_violations:bool = Form(False),
+    ocr_mode:              str  = Form("on_violation"),
 ):
     suffix = os.path.splitext(file.filename)[1] or ".mp4"
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
-    job_id = str(uuid4())
+    job_id            = str(uuid4())
     output_video_path = get_output_video_path(job_id) if save_output_video else None
 
     await job_set(job_id, {"status": "queued"})
+    logger.info(f"[{job_id}] Queued → thread pool")
 
     loop = asyncio.get_event_loop()
     loop.run_in_executor(
-        executor,
-        run_pipeline_sync,
-        job_id,
-        tmp_path,
-        output_video_path,
-        frame_skip,
-        annotate_violations,
-        annotate_no_violations,
-        ocr_mode,
+        executor, run_pipeline_sync,
+        job_id, tmp_path, output_video_path,
+        frame_skip, annotate_violations, annotate_no_violations, ocr_mode,
     )
-
     return {"job_id": job_id}
 
-# ── WebSocket ─────────────────────────────────
+
+# ── WebSocket ─────────────────────────────────────────────────────────────────
 
 @router.websocket("/ws/{job_id}")
 async def websocket_progress(websocket: WebSocket, job_id: str):
     await websocket.accept()
+    logger.info(f"[{job_id}] WS connected")
 
     pubsub = redis_client.pubsub()
-    await pubsub.subscribe(f"job_progress:{job_id}")
-
-    job = await job_get(job_id)
-    if job and job.get("status") == "completed":
-        await websocket.send_text(json.dumps({"status": "completed", **job}))
-        return
 
     try:
-        while True:
-            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if message:
-                await websocket.send_text(message["data"])
-            await asyncio.sleep(0.05)
+        # If already completed before WS connected, reply immediately
+        job = await job_get(job_id)
+        if job and job.get("status") == "completed":
+            await websocket.send_text(json.dumps({"status": "completed", **job}))
+            await websocket.close(1000)
+            return
+
+        await pubsub.subscribe(f"job_progress:{job_id}")
+
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+            raw = message["data"]
+            await websocket.send_text(raw)
+            try:
+                if json.loads(raw).get("status") in ("completed", "failed"):
+                    break
+            except Exception:
+                pass
+
+        await websocket.close(1000)
 
     except WebSocketDisconnect:
-        pass
+        logger.info(f"[{job_id}] WS disconnected by client")
+    except Exception as e:
+        logger.error(f"[{job_id}] WS error: {e}")
     finally:
-        await pubsub.unsubscribe(f"job_progress:{job_id}")
-        await pubsub.close()
+        try:
+            await pubsub.unsubscribe(f"job_progress:{job_id}")
+            await pubsub.aclose()
+        except Exception:
+            pass
 
 
-# ── Job Result ───────────────────────────────────────────────────────────────
+# ── Job result ────────────────────────────────────────────────────────────────
 
 @router.get("/job-result/{job_id}")
 async def job_result(job_id: str):
     job = await job_get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(404, "Job not found")
     if job.get("status") == "failed":
-        raise HTTPException(status_code=500, detail=job)
+        raise HTTPException(500, detail=job)
     if job.get("status") != "completed":
-        raise HTTPException(status_code=400, detail="Job not completed yet")
+        raise HTTPException(400, "Job not completed yet")
     return job
 
-# ── Job Video ───────────────────────────────────────────────────────────────
 
 @router.get("/job-video/{job_id}")
 async def job_video(job_id: str):
     if not output_video_exists(job_id):
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    path = get_output_video_path(job_id)
-
+        raise HTTPException(404, "Video file not found on disk")
     return FileResponse(
-        path,
+        get_output_video_path(job_id),
         media_type="video/mp4",
-        filename=f"{job_id}.mp4",
-        headers={
-            "Accept-Ranges": "bytes",
-            "Content-Type": "video/mp4",
-            "Cache-Control": "no-cache",
-        },
+        filename=f"output_{job_id}.mp4",
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "no-cache"},
     )
 
-# ── Violations ───────────────────────────────────────────────────────────────
+
+@router.get("/job-tracks/{job_id}")
+async def job_tracks(job_id: str):
+    job = await job_get(job_id)
+    if not job or job.get("status") != "completed":
+        raise HTTPException(404, "Job not ready")
+    ts = job.get("track_summaries", {})
+    if isinstance(ts, str):
+        try:
+            ts = json.loads(ts)
+        except Exception:
+            ts = {}
+    tracks = sorted(ts.values(), key=lambda t: t.get("first_frame", 0))
+    return {"job_id": job_id, "tracks": tracks, "count": len(tracks)}
+
+
+# ── Violations ────────────────────────────────────────────────────────────────
 
 @router.get("/violations")
 async def list_violations(
@@ -277,12 +280,9 @@ async def list_violations(
     needs_review:   Optional[bool] = Query(None),
     min_quality:    float          = Query(0.0, ge=0.0, le=1.0),
 ):
-    rows = get_violations(
-        limit=limit, offset=offset,
-        violation_type=violation_type,
-        needs_review=needs_review,
-        min_quality=min_quality,
-    )
+    rows = get_violations(limit=limit, offset=offset,
+                          violation_type=violation_type,
+                          needs_review=needs_review, min_quality=min_quality)
     return {"violations": rows, "count": len(rows)}
 
 
@@ -295,32 +295,18 @@ async def get_violation(violation_id: int):
             cur.execute("SELECT * FROM violations WHERE id = %s", (violation_id,))
             row = cur.fetchone()
             if not row:
-                raise HTTPException(status_code=404, detail="Violation not found")
+                raise HTTPException(404, "Violation not found")
             return dict(row)
     finally:
         db_gen.close()
 
-# ── Track summaries ──────────────────────────────────────────────────────────
 
-@router.get("/job-tracks/{job_id}")
-async def job_tracks(job_id: str):
-    job = await job_get(job_id)
-    if not job or job.get("status") != "completed":
-        raise HTTPException(status_code=404, detail="Job not ready")
-    track_summaries = job.get("track_summaries", {})
-    if isinstance(track_summaries, str):
-        try:
-            track_summaries = json.loads(track_summaries)
-        except Exception:
-            track_summaries = {}
-    tracks = sorted(track_summaries.values(), key=lambda t: t.get("first_frame", 0))
-    return {"job_id": job_id, "tracks": tracks, "count": len(tracks)}
-
-# ── Adaptive thresholds ──────────────────────────────────────────────────────
+# ── Thresholds ────────────────────────────────────────────────────────────────
 
 @router.get("/thresholds")
 async def get_thresholds():
     return load_threshold_state()
+
 
 @router.post("/thresholds/reset")
 async def reset_thresholds():
@@ -328,8 +314,142 @@ async def reset_thresholds():
     save_threshold_state(defaults)
     return {"status": "reset", "thresholds": defaults}
 
-# ── Legacy ───────────────────────────────────────────────────────────────────
+"""
+ROUTES ADDITIONS — append these to backend/api/routes.py
+=========================================================
+Add these two endpoints after the existing /job-video/{job_id} endpoint.
+They enable the "Available Videos" library feature on the frontend.
+"""
 
-@router.get("/job-legacy-result/{job_id}")
-async def legacy_result(job_id: str):
-    return await job_result(job_id)
+# ── Available input videos library ───────────────────────────────────────────
+
+
+@router.get("/input-videos")
+async def list_input_videos():
+    """
+    List all video files in static/inputs/ so the frontend can show
+    a library of already-uploaded videos that can be re-processed
+    without uploading again.
+    """
+    videos = []
+    if INPUTS_DIR.exists():
+        for f in sorted(INPUTS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if f.suffix.lower() in (".mp4", ".avi", ".mov", ".mkv"):
+                job_id = f.stem
+                stat   = f.stat()
+                videos.append({
+                    "job_id":        job_id,
+                    "filename":      f.name,
+                    "size_mb":       round(stat.st_size / 1024 / 1024, 2),
+                    "uploaded_at":   stat.st_mtime,
+                    "has_output":    output_video_exists(job_id),
+                })
+    return {"videos": videos, "count": len(videos)}
+
+
+@router.post("/process-existing/{job_id}")
+async def process_existing_video(
+    job_id:                str,
+    frame_skip:            int  = Form(1),
+    save_output_video:     bool = Form(True),
+    annotate_violations:   bool = Form(True),
+    annotate_no_violations: bool = Form(False),
+    ocr_mode:              str  = Form("on_violation"),
+):
+    """
+    Kick off processing for a video already on disk in static/inputs/{job_id}.mp4.
+    Returns the same shape as /process-video so the frontend can reuse
+    its existing WebSocket + result-fetch flow without any changes.
+    """
+    input_path = INPUTS_DIR / f"{job_id}.mp4"
+    if not input_path.exists():
+        raise HTTPException(404, f"Input video {job_id}.mp4 not found on disk")
+
+    new_job_id   = str(uuid4())
+    output_path  = get_output_video_path(new_job_id)
+
+    await job_set(new_job_id, {"status": "queued", "progress": 0})
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(
+        executor,
+        run_pipeline_existing,
+        new_job_id,
+        str(input_path),
+        output_path,
+        frame_skip,
+        annotate_violations,
+        annotate_no_violations,
+        ocr_mode,
+    )
+
+    return {"job_id": new_job_id, "source_job_id": job_id, "status": "queued"}
+
+
+# ── Pipeline runner for already-stored input videos ───────────────────────────
+# Differs from run_pipeline_sync: does NOT call save_input_video (no copy needed)
+# and does NOT delete tmp_path in finally (the file must stay in static/inputs/).
+
+def run_pipeline_existing(job_id, video_path, output_video_path,
+                          frame_skip, annotate_violations, annotate_no_violations, ocr_mode):
+    import redis as sync_redis
+    import traceback
+
+    r = sync_redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", 6379)),
+        decode_responses=True,
+    )
+    channel    = f"job_progress:{job_id}"
+    start_time = time.time()
+
+    def publish(data):
+        r.hset(f"job:{job_id}", mapping={
+            k: json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+            for k, v in data.items()
+        })
+        r.publish(channel, json.dumps(data))
+
+    try:
+        logger.info(f"[{job_id}] Processing existing input: {video_path}")
+        publish({"status": "running", "progress": 0, "total": 0, "fps": 0})
+
+        def progress_cb(frames, total):
+            elapsed = time.time() - start_time
+            publish({
+                "status":   "running",
+                "progress": frames,
+                "total":    total,
+                "fps":      round(frames / elapsed if elapsed > 0 else 0, 2),
+            })
+
+        output = process_video(
+            video_path=video_path,
+            output_video_path=output_video_path,
+            frame_skip=frame_skip,
+            annotate_violations=annotate_violations,
+            annotate_no_violations=annotate_no_violations,
+            ocr_mode=ocr_mode,
+            progress_callback=progress_cb,
+            job_id=job_id,
+        )
+
+        if output.get("violations"):
+            store_violations_batch(output["violations"])
+
+        summary   = generate_violation_summary(output)
+        video_url = output.get("video_url") or get_video_url(job_id)
+
+        logger.info(f"[{job_id}] Complete | video_url={video_url}")
+        publish({
+            "status":          "completed",
+            "summary":         summary,
+            "metadata":        output.get("metadata", {}),
+            "track_summaries": output.get("track_summaries", {}),
+            "video_url":       video_url,
+        })
+
+    except Exception as e:
+        logger.error(f"[{job_id}] Error: {e}")
+        publish({"status": "failed", "error": str(e), "trace": traceback.format_exc()})
+    # No finally delete — static/inputs/ files are permanent.

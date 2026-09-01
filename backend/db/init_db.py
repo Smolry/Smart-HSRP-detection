@@ -7,7 +7,7 @@ import os
 # ─────────────────────────────────────────────
 
 DB_NAME = "smart_hsrp"
-DB_USER = "postgres"
+DB_USER = "hsrp"
 DB_PASSWORD = "aniket8087160135"
 DB_HOST = "localhost"
 DB_PORT = 5432

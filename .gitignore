@@ -34,12 +34,21 @@ build/
 *.temp
 
 # Model weights (if large)
-weights
+weights/
 *.pt
 *.pth
+*.onnx
+*.engine
 
 # Output videos (VERY IMPORTANT)
 static/outputs/
 uploads/
+results/
+datasets/
 
 *.pem
+
+# Large files
+*.mp4
+*.avi
+*.zip
