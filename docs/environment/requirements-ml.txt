@@ -1,0 +1,16 @@
+# Smart-HSRP known-good ML core
+# Python: 3.13.13
+# CUDA build: 13.0
+# GPU reference: NVIDIA Tesla T4
+#
+# This is NOT a complete pip-freeze. Use snapshot-environment.sh to create
+# the complete machine-specific package snapshot.
+
+torch==2.10.0+cu130
+torchvision==0.25.0+cu130
+torchaudio==2.10.0+cu130
+torchdata==0.11.0
+ultralytics==8.4.53
+
+# TensorRT is intentionally not installed by this file because it includes
+# native/runtime components. Known-good reference: TensorRT 10.16.1.

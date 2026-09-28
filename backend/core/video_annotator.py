@@ -252,7 +252,7 @@ class AsyncVideoWriter:
         self._error = None
 
         try:
-            fourcc = cv2.VideoWriter_fourcc(*"avc1")
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             self._writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
             
             if not self._writer.isOpened():
